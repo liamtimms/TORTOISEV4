@@ -6,7 +6,11 @@ SET(USEOPENMP 1)
  #  SET(CMAKE_BUILD_TYPE Debug)
  #  SET(ISDEBUG 1)
 
-
+option(BUILD_TESTS "Build unit tests" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(${CMAKE_SOURCE_DIR}/../tests ${CMAKE_BINARY_DIR}/tests)
+endif()
 
 if ( NOT DEFINED USECUDA)
     SET(USECUDA  0)

@@ -4,6 +4,7 @@
 
 #include "TORTOISE.h"
 #include "mecc_settings.h"
+#include "slice_timing_utils.h"
 
 
 class DIFFPREP
@@ -21,7 +22,6 @@ public:
 
 
 protected:
-    vnl_matrix<int> ParseJSONForSliceTiming(json cjson);
     void GetSmallBigDelta(float &small_delta,float &big_delta);
 
 

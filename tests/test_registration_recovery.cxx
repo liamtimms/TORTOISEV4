@@ -5,6 +5,7 @@
 #include "test_macros.h"
 #include "test_image_helpers.h"
 #include "register_dwi_to_b0.h"
+#include "rigid_register_images.h"
 
 // RegisterDWIToB0 calls TORTOISE::GetAvailableITKThreadFor() which needs
 // these static definitions. Provided via linking TORTOISE_global.cxx.
@@ -162,6 +163,41 @@ void test_flags_respected()
 }
 
 
+// ============================================================
+// Test: MultiStartRigidSearchCoarseToFine recovers large rotation
+// ============================================================
+void test_coarse_to_fine_large_rotation()
+{
+    // Create fixed: large enough for downsampling (4x and 2x)
+    auto fixed = create_gaussian_blob(48, 48, 24, 2.0, 2.0, 2.0,
+                                       20.0, 25.0, 15.0, 800.0f);
+
+    // Apply 25° rotation about Y (0.436 rad)
+    auto true_transform = TestTransformType::New();
+    true_transform->SetPhase("vertical");
+    true_transform->SetIdentity();
+    auto tp = true_transform->GetParameters();
+    tp[4] = 0.436;  // ~25° about Y
+    true_transform->SetParameters(tp);
+
+    auto moving = apply_transform_to_image(fixed, true_transform);
+
+    // Call coarse-to-fine multistart search
+    auto result = MultiStartRigidSearchCoarseToFine(fixed, moving, "CC");
+
+    ASSERT_TRUE(result != nullptr);
+
+    auto rp = result->GetParameters();
+
+    // Euler3DTransform params: [Rx, Ry, Rz, Tx, Ty, Tz]
+    // OkanQuadratic params:    [Tx, Ty, Tz, Rx, Ry, Rz, ...]
+    // We applied Ry=0.436 in Okan space (index 4), recover from Euler (index 1)
+    double recovered_ry = rp[1];
+    // Allow 15° tolerance (0.26 rad) — coarse search uses large steps
+    ASSERT_TRUE(std::fabs(std::fabs(recovered_ry) - 0.436) < 0.26);
+}
+
+
 int main()
 {
     std::cout << "=== Registration Recovery Tests ===" << std::endl;
@@ -169,6 +205,7 @@ int main()
     TEST(translation_recovery);
     TEST(rigid_recovery);
     TEST(flags_respected);
+    TEST(coarse_to_fine_large_rotation);
 
     TEST_SUMMARY();
 }

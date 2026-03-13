@@ -181,7 +181,7 @@ IF(USECUDA)
 
 ELSE(USECUDA)
     if(NOT QSIPREP)
-    SET(CMAKE_EXE_LINKER_FLAGS "-static ")
+    SET(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++")
     endif()
     add_executable(TORTOISEProcess ../src/main/main.cxx  ../src/main/register_dwi_to_b0.cxx  ../src/tools/DRTAMAS/DRTAMAS_utilities_cp.cxx ../src/tools/ResampleDWIs/resample_dwis.cxx  ../src/tools/DRBUDDI/DRBUDDI_parserBase.cxx ../src/tools/EstimateTensor/DTIModel.cxx ../src/tools/EstimateMAPMRI/MAPMRIModel.cxx   ../src/tools/RotateBMatrix/rotate_bmatrix.cxx ../src/main/FINALDATA.cxx ../src/main/TORTOISE.cxx ../src/main/DIFFPREP.cxx ../src/main/DRBUDDI.cxx ../src/main/DRBUDDIBase.cxx ../src/main/EPIREG.cxx ../src/main/DRBUDDI_Diffeo.cxx ../src/main/run_drbuddi_stage.cxx ../src/main/drbuddi_image_utilities.cxx   ../src/tools/EstimateTensor/estimate_tensor_wlls.cxx ../src/main/create_mask.cxx ../src/tools/ResampleDWIs/resample_dwis.cxx ../src/main/rigid_register_images.cxx ../src/main/TORTOISE_parser.cxx  ../src/tools/gradnonlin/init_iso_gw.cxx ../src/tools/gradnonlin/gradcal.cxx ${SOURCES})
     target_link_libraries(TORTOISEProcess Eigen3::Eigen ${ITK_LIBRARIES}  ${Boost_LIBRARIES} ${CMAKE_CURRENT_BINARY_DIR}/../external_libraries/bet/Linux/libbetokan.a -lz fftw3 )
@@ -252,7 +252,8 @@ add_executable(CreateNonlinearityDisplacementMap ../src/tools/gradnonlin/mk_disp
 target_link_libraries(CreateNonlinearityDisplacementMap ${ITK_LIBRARIES} ${Boost_LIBRARIES} )
 
 
-add_executable(SelectBestB0 ../src/tools/SelectBestB0/SelectBestB0_main.cxx ../src/main/rigid_register_images.cxx ${SOURCES})
+add_executable(SelectBestB0 ../src/tools/SelectBestB0/SelectBestB0_main.cxx ../src/main/rigid_register_images.cxx ../src/tools/ResampleDWIs/resample_dwis.cxx ${SOURCES})
+target_include_directories(SelectBestB0 PRIVATE ../src/tools/ResampleDWIs)
 target_link_libraries(SelectBestB0 ${ITK_LIBRARIES} ${Boost_LIBRARIES} )
 
 
@@ -472,7 +473,8 @@ add_executable(ApplyTransformationToScalar2 ../src/tools/ApplyTransformationToSc
 target_link_libraries(ApplyTransformationToScalar2 ${ITK_LIBRARIES} ${Boost_LIBRARIES}  )
 
 
-add_executable(CreateGradientNonlinearityBMatrix ../src/tools/DRTAMAS/DRTAMAS_utilities_cp.cxx   ../src/tools/CreateGradientNonlinearityBMatrix/CreateGradientNonlinearityBMatrix.cxx  ../src/tools/CreateGradientNonlinearityBMatrix/CreateGradientNonlinearityBMatrix_parser.cxx ../src/tools/gradnonlin/init_iso_gw.cxx ../src/tools/gradnonlin/gradcal.cxx ../src/main/rigid_register_images.cxx ${SOURCES})
+add_executable(CreateGradientNonlinearityBMatrix ../src/tools/DRTAMAS/DRTAMAS_utilities_cp.cxx   ../src/tools/CreateGradientNonlinearityBMatrix/CreateGradientNonlinearityBMatrix.cxx  ../src/tools/CreateGradientNonlinearityBMatrix/CreateGradientNonlinearityBMatrix_parser.cxx ../src/tools/gradnonlin/init_iso_gw.cxx ../src/tools/gradnonlin/gradcal.cxx ../src/main/rigid_register_images.cxx ../src/tools/ResampleDWIs/resample_dwis.cxx ${SOURCES})
+target_include_directories(CreateGradientNonlinearityBMatrix PRIVATE ../src/tools/ResampleDWIs)
 target_link_libraries(CreateGradientNonlinearityBMatrix  ${ITK_LIBRARIES} ${Boost_LIBRARIES}  )
 
 

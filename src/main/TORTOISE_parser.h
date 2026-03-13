@@ -74,6 +74,14 @@ public:
 
 
     int getNiter();
+    bool getS2VWarmStart();
+    float getS2VConvergenceThreshold();
+    bool getLargeMotionCorrection();
+    bool getS2VMultistart();
+    std::string getS2VSmoothingSchedule();
+    std::string getMAPMRIDegreeSchedule();
+    float getS2VLambda();
+    int getS2VNiter();
     int getDTIBval();
     int getHARDIBval();
 

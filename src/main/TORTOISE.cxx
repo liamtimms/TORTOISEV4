@@ -455,6 +455,14 @@ void TORTOISE::UpdateSettingsFromCommandLine()
 
     RegistrationSettings::get().setValue<int>("is_human_brain",parser->getIsHuman());
     RegistrationSettings::get().setValue<int>("niter",parser->getNiter());
+    RegistrationSettings::get().setValue<bool>("s2v_warm_start",parser->getS2VWarmStart());
+    RegistrationSettings::get().setValue<float>("s2v_convergence_threshold",parser->getS2VConvergenceThreshold());
+    RegistrationSettings::get().setValue<bool>("large_motion_correction",parser->getLargeMotionCorrection());
+    RegistrationSettings::get().setValue<bool>("s2v_multistart",parser->getS2VMultistart());
+    RegistrationSettings::get().setValue<std::string>("s2v_smoothing_schedule",parser->getS2VSmoothingSchedule());
+    RegistrationSettings::get().setValue<std::string>("mapmri_degree_schedule",parser->getMAPMRIDegreeSchedule());
+    RegistrationSettings::get().setValue<float>("s2v_lambda",parser->getS2VLambda());
+    RegistrationSettings::get().setValue<int>("s2v_niter",parser->getS2VNiter());
     RegistrationSettings::get().setValue<int>("dti_bval",parser->getDTIBval());
     RegistrationSettings::get().setValue<int>("hardi_bval",parser->getHARDIBval());
 

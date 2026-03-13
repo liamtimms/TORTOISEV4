@@ -14,6 +14,8 @@
 
 #include <chrono>
 #include <thread>
+#include <sstream>
+#include "parse_schedule.h"
 
 #include "boost/filesystem/path.hpp"
 
@@ -29,6 +31,7 @@
 #include "../utilities/math_utilities.h"
 #include "../tools/ConvertQuadraticTransformToDisplacementField/convert_eddy_trans_to_field.hxx"
 #include "register_dwi_to_slice.h"
+#include "rigid_register_images.h"
 
 #include "../tools/RotateBMatrix/rotate_bmatrix.h"
 #include "itkNearestNeighborInterpolateImageFunction.h"
@@ -660,7 +663,7 @@ void DIFFPREP::SynthMotionEddyCorrectAllDWIs(std::vector<ImageType3D::Pointer> t
                     {
                     //    TORTOISE::ReserveGPU(gpu_ids_per_thread[vol]);
                         cudaSetDevice(cuda_device_ids[gpu_ids_per_thread[vol]]);
-                        curr_trans=  RegisterDWIToB0_cuda(target_target, curr_vol, this->PE_string, this->mecc_settings,true,signal_ranges);
+                        curr_trans=  RegisterDWIToB0_cuda(target_target, curr_vol, this->PE_string, this->mecc_settings,true,signal_ranges,vol);
                    //     TORTOISE::ReleaseGPU(gpu_ids_per_thread[vol]);
                     }
                 #else
@@ -1268,6 +1271,118 @@ std::vector<ImageType3D::Pointer> DIFFPREP::ReplaceOutliers( std::vector<ImageTy
 
 
 
+void DIFFPREP::LargeMotionVolumeCorrection(std::vector<ImageType3D::Pointer>& dwis)
+{
+    (*stream)<<"Stage 0: Large-motion volume-level correction using multistart..."<<std::endl;
+
+    ImageType3D::Pointer b0_img = dwis[this->b0_vol_id];
+
+    // Downsample b0 image by 2x for speed
+    std::vector<float> new_res(3), factors;
+    new_res[0]= b0_img->GetSpacing()[0] * 2.0;
+    new_res[1]= b0_img->GetSpacing()[1] * 2.0;
+    new_res[2]= b0_img->GetSpacing()[2] * 2.0;
+    ImageType3D::Pointer b0_down = resample_3D_image(b0_img, new_res, factors, "Linear");
+
+    int Nt= omp_get_max_threads();
+
+    (*stream)<<"Done large-motion correcting vol: "<<std::flush;
+
+    #pragma omp parallel for
+    for(int vol=0; vol<Nvols; vol++)
+    {
+        TORTOISE::EnableOMPThread();
+
+        if(vol == this->b0_vol_id)
+        {
+            OkanQuadraticTransformType::Pointer id_trans = OkanQuadraticTransformType::New();
+            id_trans->SetPhase(this->PE_string);
+            id_trans->SetIdentity();
+            dwi_transforms[vol]->ClearTransformQueue();
+            dwi_transforms[vol]->AddTransform(id_trans);
+        }
+        else
+        {
+            std::vector<float> vol_factors;
+            ImageType3D::Pointer dwi_down = resample_3D_image(dwis[vol], new_res, vol_factors, "Linear");
+
+            RigidTransformType::Pointer rigid_result = MultiStartRigidSearchCoarseToFine(b0_down, dwi_down, "MI");
+
+            // Convert rigid result into OkanQuadraticTransform
+            OkanQuadraticTransformType::Pointer quad_trans = OkanQuadraticTransformType::New();
+            quad_trans->SetPhase(this->PE_string);
+            quad_trans->SetIdentity();
+            OkanQuadraticTransformType::ParametersType params = quad_trans->GetParameters();
+            params[0] = rigid_result->GetOffset()[0];
+            params[1] = rigid_result->GetOffset()[1];
+            params[2] = rigid_result->GetOffset()[2];
+            params[3] = rigid_result->GetAngleX();
+            params[4] = rigid_result->GetAngleY();
+            params[5] = rigid_result->GetAngleZ();
+            quad_trans->SetParameters(params);
+
+            dwi_transforms[vol]->ClearTransformQueue();
+            dwi_transforms[vol]->AddTransform(quad_trans);
+
+            #pragma omp critical
+            {
+                (*stream)<<", "<<vol<<std::flush;
+            }
+        }
+        TORTOISE::DisableOMPThread();
+    }
+    (*stream)<<std::endl<<std::endl;
+    omp_set_num_threads(Nt);
+}
+
+
+void DIFFPREP::TemporalRegularizeS2VTransforms(
+    std::vector<OkanQuadraticTransformType::Pointer>& s2v_trans,
+    vnl_matrix<int> slspec,
+    float lambda)
+{
+    if(lambda <= 0) return;
+
+    int Nexc = slspec.rows();
+    int MB = slspec.cols();
+    if(Nexc < 3) return;
+
+    int nparams = 6;
+
+    vnl_matrix<double> params(Nexc, nparams);
+    for(int e = 0; e < Nexc; e++)
+    {
+        if(s2v_trans.size() <= (size_t)slspec(e,0) || !s2v_trans[slspec(e,0)])
+            return;
+        auto p = s2v_trans[slspec(e,0)]->GetParameters();
+        for(int j = 0; j < nparams; j++)
+            params(e, j) = p[j];
+    }
+
+    vnl_matrix<double> smoothed(Nexc, nparams);
+    for(int j = 0; j < nparams; j++)
+    {
+        smoothed(0, j) = (2.0*params(0,j) + params(1,j)) / 3.0;
+        for(int e = 1; e < Nexc-1; e++)
+            smoothed(e, j) = (params(e-1,j) + 2.0*params(e,j) + params(e+1,j)) / 4.0;
+        smoothed(Nexc-1, j) = (params(Nexc-2,j) + 2.0*params(Nexc-1,j)) / 3.0;
+    }
+
+    for(int e = 0; e < Nexc; e++)
+    {
+        auto p = s2v_trans[slspec(e,0)]->GetParameters();
+        auto new_p = p;
+        for(int j = 0; j < nparams; j++)
+            new_p[j] = (1.0 - lambda) * params(e,j) + lambda * smoothed(e,j);
+
+        for(int kk = 0; kk < MB; kk++)
+        {
+            if((size_t)slspec(e,kk) < s2v_trans.size() && s2v_trans[slspec(e,kk)])
+                s2v_trans[slspec(e,kk)]->SetParameters(new_p);
+        }
+    }
+}
+
 
 void DIFFPREP::MotionAndEddy()
 {
@@ -1355,6 +1470,13 @@ void DIFFPREP::MotionAndEddy()
 
 
 
+    ///////////////////////////// STAGE 0: LARGE MOTION CORRECTION ////////////////////////
+    bool large_motion = RegistrationSettings::get().getValue<bool>(std::string("large_motion_correction"));
+    if(large_motion)
+    {
+        LargeMotionVolumeCorrection(native_native_raw_dwis);
+    }
+
     ///////////////////////////// FIRST PASS ///////////////////////////////////////////
      if(iterative)
          (*stream)<<"Performing FIRST PASS of iterative correction..."<<std::endl<<std::endl;
@@ -1371,7 +1493,21 @@ void DIFFPREP::MotionAndEddy()
 
      if(iterative)         //OHHH THIS IS GONNA BE A BIG ONE :)
      {
-         const unsigned int  CORRECTION_STAGE_MAPMRI_DEGREE=4;
+         // Progressive MAPMRI degree schedule (like EDDY's progressive GP complexity)
+         // e.g. "2,4,4" = degree 2 in epoch 1, degree 4 in epochs 2+
+         std::string mapmri_degree_str = RegistrationSettings::get().getValue<std::string>(std::string("mapmri_degree_schedule"));
+         std::vector<int> mapmri_degree_schedule = parse_int_schedule(mapmri_degree_str, {2, 4, 4});
+
+         // Per-epoch smoothing schedule for s2v registration (like EDDY's --fwhm)
+         std::string s2v_smooth_str = RegistrationSettings::get().getValue<std::string>(std::string("s2v_smoothing_schedule"));
+         std::vector<float> s2v_smoothing_schedule = parse_float_schedule(s2v_smooth_str, {1.0f, 0.5f, 0.0f});
+
+         // Temporal regularization strength for s2v (like EDDY's --s2v_lambda)
+         float s2v_lambda = RegistrationSettings::get().getValue<float>(std::string("s2v_lambda"));
+
+         // Number of s2v sub-iterations per epoch (like EDDY's --s2v_niter)
+         int s2v_niter = RegistrationSettings::get().getValue<int>(std::string("s2v_niter"));
+         if(s2v_niter < 1) s2v_niter = 1;
 
          //Get small delta and big delta from either input or estimate them
          float big_delta=0, small_delta=0;
@@ -1452,10 +1588,29 @@ void DIFFPREP::MotionAndEddy()
          }
 
 
+         float s2v_conv_threshold = RegistrationSettings::get().getValue<float>(std::string("s2v_convergence_threshold"));
+
          //EPOCHS
          for(int epoch=1;epoch<=Nepoch;epoch++)
          {
              (*stream)<<"EPOCH: " <<epoch<<std::endl;
+
+             // Store previous s2v parameters for convergence check
+             std::vector<std::vector<OkanQuadraticTransformType::ParametersType>> prev_s2v_params;
+             if(slice_to_volume && s2v_conv_threshold > 0 && s2v_transformations.size() > 0)
+             {
+                 prev_s2v_params.resize(Nvols);
+                 int Nslices = native_native_raw_dwis[0]->GetLargestPossibleRegion().GetSize()[2];
+                 for(int vol=0; vol<Nvols; vol++)
+                 {
+                     prev_s2v_params[vol].resize(Nslices);
+                     for(int k=0; k<Nslices; k++)
+                     {
+                         if(s2v_transformations[vol].size() > (size_t)k && s2v_transformations[vol][k])
+                             prev_s2v_params[vol][k] = s2v_transformations[vol][k]->GetParameters();
+                     }
+                 }
+             }
 
              // Transform all DWIs with inter-volume motion & eddy-currents transformations
              #pragma omp parallel for
@@ -1510,7 +1665,11 @@ void DIFFPREP::MotionAndEddy()
                  MAPMRIModel mapmri_estimator;
                  if(MAPMRI_indices.size()>0)
                  {
-                     mapmri_estimator.SetMAPMRIDegree(CORRECTION_STAGE_MAPMRI_DEGREE);
+                     // Progressive MAPMRI degree: use schedule to determine degree for this epoch
+                     int epoch_mapmri_degree = schedule_value(mapmri_degree_schedule, epoch-1);
+                     epoch_mapmri_degree = std::max(0, epoch_mapmri_degree);
+                     if(epoch_mapmri_degree % 2 != 0) epoch_mapmri_degree++;
+                     mapmri_estimator.SetMAPMRIDegree(epoch_mapmri_degree);
                      mapmri_estimator.SetDTImg(dti_estimator.GetOutput());
                      mapmri_estimator.SetA0Image(dti_estimator.GetA0Image());
                      mapmri_estimator.SetBmatrix(Bmatrix);
@@ -1598,37 +1757,112 @@ void DIFFPREP::MotionAndEddy()
              } //dummy for memory cleaning
 
 
-             //slice to volume registration
+             //slice to volume registration with sub-iterations, smoothing schedule, and temporal regularization
              if(slice_to_volume)
              {
-                 (*stream)<<"Done Slice-to-volume registering volume: " <<std::flush;              
+                 // Determine smoothing sigma for this epoch from schedule
+                 float epoch_sigma = schedule_value(s2v_smoothing_schedule, epoch-1);
 
-                 #pragma omp parallel for
-                 for(int vol=0;vol<Nvols;vol++)
+                 bool s2v_warm_setting = RegistrationSettings::get().getValue<bool>(std::string("s2v_warm_start"));
+                 bool s2v_ms = RegistrationSettings::get().getValue<bool>(std::string("s2v_multistart"));
+
+                 // Sub-iteration loop (like EDDY's --s2v_niter)
+                 int effective_s2v_niter = (s2v_ms && epoch == 1) ? 1 : s2v_niter; // No sub-iters for multistart epoch
+                 for(int s2v_iter = 0; s2v_iter < effective_s2v_niter; s2v_iter++)
                  {
-                     TORTOISE::EnableOMPThread();
+                     // Smoothing decreases across sub-iterations within an epoch
+                     float sub_sigma = epoch_sigma * std::max(0.0f, 1.0f - (float)s2v_iter / effective_s2v_niter);
 
-                     ImageType3D::Pointer target= native_native_raw_dwis[vol];
-                     ImageType3D::Pointer native_synth_img =s2v_replaced_synth_dwis[vol] ;
+                     // Warm-start: from previous epoch (if enabled) OR from previous sub-iteration
+                     bool warm = (s2v_warm_setting && (epoch > 1)) || (s2v_iter > 0);
 
-                     std::vector<float> signal_ranges = choose_range(target, native_synth_img,b0_mask_img);
+                     if(s2v_iter == 0)
+                         (*stream)<<"S2V epoch "<<epoch<<" (sigma="<<sub_sigma<<", niter="<<effective_s2v_niter<<")"<<std::endl;
+                     (*stream)<<"Done Slice-to-volume registering volume: " <<std::flush;
 
-                     //for the first few epochs we only do rigid registration for sv2
-                     //for the last one, we also do quadratic
-                     bool do_eddy=true;
-                     if(epoch==1)
-                         do_eddy=false;
+                     #pragma omp parallel for
+                     for(int vol=0;vol<Nvols;vol++)
+                     {
+                         TORTOISE::EnableOMPThread();
 
-                     VolumeToSliceRegistration(target, native_synth_img,slspec,signal_ranges,s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol);
-                     #pragma omp critical
-                     {                         
-                         (*stream)<<vol<<", "<<std::flush;
+                         ImageType3D::Pointer target= native_native_raw_dwis[vol];
+                         ImageType3D::Pointer native_synth_img =s2v_replaced_synth_dwis[vol] ;
+
+                         std::vector<float> signal_ranges = choose_range(target, native_synth_img,b0_mask_img);
+
+                         //for the first few epochs we only do rigid registration for sv2
+                         //for the last one, we also do quadratic
+                         bool do_eddy=true;
+                         if(epoch==1)
+                             do_eddy=false;
+
+                         if(s2v_ms && epoch == 1 && s2v_iter == 0)
+                             VolumeToSliceRegistrationWithMultistart(target, native_synth_img,slspec,signal_ranges,s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol);
+                         else
+                         {
+                             #ifdef USECUDA
+                                 VolumeToSliceRegistration_cuda(target, native_synth_img,slspec,signal_ranges,s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol,warm,sub_sigma);
+                             #else
+                                 VolumeToSliceRegistration(target, native_synth_img,slspec,signal_ranges,s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol,warm,sub_sigma);
+                             #endif
+                         }
+                         #pragma omp critical
+                         {
+                             (*stream)<<vol<<", "<<std::flush;
+                         }
+                         TORTOISE::DisableOMPThread();
+                     } //for vol
+                     (*stream)<<std::endl;
+
+                     // Temporal regularization after each sub-iteration (like EDDY's --s2v_lambda)
+                     if(s2v_lambda > 0)
+                     {
+                         // Lambda decreases across epochs and sub-iterations
+                         float iter_lambda = (s2v_lambda / epoch) * (1.0f - 0.5f * s2v_iter / effective_s2v_niter);
+                         for(int vol = 0; vol < Nvols; vol++)
+                             TemporalRegularizeS2VTransforms(s2v_transformations[vol], slspec, iter_lambda);
+                         if(s2v_iter == 0)
+                             (*stream)<<"  Applied temporal regularization (lambda="<<iter_lambda<<")"<<std::endl;
                      }
-                     TORTOISE::DisableOMPThread();
-                 } //for vol
+                 } // s2v sub-iterations
              } //if s2v
 
              (*stream)<<std::endl<<std::endl;
+
+             // Convergence check for s2v
+             if(slice_to_volume && s2v_conv_threshold > 0 && prev_s2v_params.size() > 0 && epoch > 1)
+             {
+                 double total_change = 0;
+                 int count = 0;
+                 int Nslices = native_native_raw_dwis[0]->GetLargestPossibleRegion().GetSize()[2];
+                 for(int vol=0; vol<Nvols; vol++)
+                 {
+                     for(int k=0; k<Nslices; k++)
+                     {
+                         if(s2v_transformations[vol].size() > (size_t)k && s2v_transformations[vol][k]
+                            && prev_s2v_params[vol].size() > (size_t)k && prev_s2v_params[vol][k].GetSize() > 0)
+                         {
+                             OkanQuadraticTransformType::ParametersType curr_params = s2v_transformations[vol][k]->GetParameters();
+                             // Check rigid params (0-5: translations + rotations)
+                             for(int p=0; p<6; p++)
+                             {
+                                 total_change += fabs(curr_params[p] - prev_s2v_params[vol][k][p]);
+                                 count++;
+                             }
+                         }
+                     }
+                 }
+                 if(count > 0)
+                 {
+                     double mean_change = total_change / count;
+                     (*stream)<<"S2V convergence metric (mean abs param change): " << mean_change << std::endl;
+                     if(mean_change < s2v_conv_threshold)
+                     {
+                         (*stream)<<"S2V converged at epoch " << epoch << " (threshold: " << s2v_conv_threshold << "). Final synth pass and stopping." << std::endl;
+                         Nepoch = epoch; // This will cause the loop to end after this iteration
+                     }
+                 }
+             }
 
              if(outlier_replacement)
              {
@@ -1749,6 +1983,31 @@ void DIFFPREP::MotionAndEddy()
              // We can use that to improve inter-volume motion and eddy currents distortions.
              SynthMotionEddyCorrectAllDWIs(eddy_s2v_replaced_synth_dwis,s2v_replaced_raw_dwis);
 
+             // Inter-volume registration convergence monitoring (informational logging)
+             if(epoch > 1)
+             {
+                 double total_vol_change = 0;
+                 int vol_count = 0;
+                 for(int vol = 0; vol < Nvols; vol++)
+                 {
+                     if(dwi_transforms[vol] && dwi_transforms[vol]->GetNumberOfTransforms() > 0)
+                     {
+                         auto curr_params = dwi_transforms[vol]->GetNthTransform(
+                             dwi_transforms[vol]->GetNumberOfTransforms()-1)->GetParameters();
+                         if(curr_params.GetSize() >= 6)
+                         {
+                             for(int p = 0; p < 6; p++)
+                                 total_vol_change += fabs(curr_params[p]);
+                             vol_count++;
+                         }
+                     }
+                 }
+                 if(vol_count > 0)
+                 {
+                     double mean_vol_magnitude = total_vol_change / (vol_count * 6);
+                     (*stream)<<"  Inter-volume mean rigid param magnitude: " << mean_vol_magnitude << std::endl;
+                 }
+             }
 
          } //for epoch
      } //if iterative

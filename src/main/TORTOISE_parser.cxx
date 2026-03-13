@@ -458,6 +458,70 @@ void TORTOISE_PARSER::InitializeCommandLineOptions()
         this->AddOption( option );
     }
     {
+        std::string description = std::string("Warm-start s2v transforms from the previous epoch (boolean). When enabled, slice-to-volume transforms from epoch N initialize epoch N+1. Default: 0")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "s2v_warm_start");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
+        std::string description = std::string("Convergence threshold for s2v (float). Mean rigid parameter change below this stops iterations early. Set to 0 to disable convergence checking. Default: 0")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "s2v_convergence_threshold");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
+        std::string description = std::string("Enable Stage 0: large-motion volume-level correction using multistart rigid search (boolean). Use when volumes may be rotated up to 90 degrees. Default: 0")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "large_motion_correction");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
+        std::string description = std::string("Enable multistart search at slice-group level in first s2v epoch (boolean). Use when slice groups have large intra-volume motion. Default: 0")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "s2v_multistart");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
+        std::string description = std::string("Comma-separated smoothing sigmas (in voxels) per epoch for s2v registration. If fewer values than epochs, last value repeats. Default: 0 (no smoothing). Typical multi-epoch value: 1.0,0.5,0.0")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "s2v_smoothing_schedule");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
+        std::string description = std::string("Comma-separated MAPMRI degrees per epoch for iterative correction. If fewer values than epochs, last value repeats. Default: 4 (matches original). Typical multi-epoch value: 2,4,4")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "mapmri_degree_schedule");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
+        std::string description = std::string("Temporal regularization strength for s2v transforms (float). Smooths rigid parameters across excitation groups. 0 = disabled. Typical value for MB data: 0.5. Default: 0")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "s2v_lambda");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
+        std::string description = std::string("Number of s2v registration sub-iterations within each epoch (int). Higher values help s2v converge before signal model re-fit. Default: 1. EDDY equivalent: 5")  ;
+        OptionType::Pointer option = OptionType::New();
+        option->SetLongName( "s2v_niter");
+        option->SetDescription( description );
+        option->SetModule(4);
+        this->AddOption( option );
+    }
+    {
         std::string description = std::string("DTI bval (int). In case non in-vivo human brain data, or to overwrite the default value of 1000 s/mm2, what is the bval for DTI regime? Default:1000  ")  ;
         OptionType::Pointer option = OptionType::New();
         option->SetLongName( "dti_bval");
@@ -953,6 +1017,70 @@ int TORTOISE_PARSER::getNiter()
         return  (atoi(option->GetFunction(0)->GetName().c_str()));
     else
        return 3;
+}
+bool TORTOISE_PARSER::getS2VWarmStart()
+{
+    OptionType::Pointer option = this->GetOption( "s2v_warm_start");
+    if(option->GetNumberOfFunctions())
+        return  (bool)(atoi(option->GetFunction(0)->GetName().c_str()));
+    else
+       return 0;
+}
+float TORTOISE_PARSER::getS2VConvergenceThreshold()
+{
+    OptionType::Pointer option = this->GetOption( "s2v_convergence_threshold");
+    if(option->GetNumberOfFunctions())
+        return  atof(option->GetFunction(0)->GetName().c_str());
+    else
+       return 0;
+}
+bool TORTOISE_PARSER::getLargeMotionCorrection()
+{
+    OptionType::Pointer option = this->GetOption( "large_motion_correction");
+    if(option->GetNumberOfFunctions())
+        return  (bool)(atoi(option->GetFunction(0)->GetName().c_str()));
+    else
+       return 0;
+}
+bool TORTOISE_PARSER::getS2VMultistart()
+{
+    OptionType::Pointer option = this->GetOption( "s2v_multistart");
+    if(option->GetNumberOfFunctions())
+        return  (bool)(atoi(option->GetFunction(0)->GetName().c_str()));
+    else
+       return 0;
+}
+std::string TORTOISE_PARSER::getS2VSmoothingSchedule()
+{
+    OptionType::Pointer option = this->GetOption( "s2v_smoothing_schedule");
+    if(option->GetNumberOfFunctions())
+        return  option->GetFunction(0)->GetName();
+    else
+       return std::string("0");
+}
+std::string TORTOISE_PARSER::getMAPMRIDegreeSchedule()
+{
+    OptionType::Pointer option = this->GetOption( "mapmri_degree_schedule");
+    if(option->GetNumberOfFunctions())
+        return  option->GetFunction(0)->GetName();
+    else
+       return std::string("4");
+}
+float TORTOISE_PARSER::getS2VLambda()
+{
+    OptionType::Pointer option = this->GetOption( "s2v_lambda");
+    if(option->GetNumberOfFunctions())
+        return  atof(option->GetFunction(0)->GetName().c_str());
+    else
+       return 0;
+}
+int TORTOISE_PARSER::getS2VNiter()
+{
+    OptionType::Pointer option = this->GetOption( "s2v_niter");
+    if(option->GetNumberOfFunctions())
+        return  (atoi(option->GetFunction(0)->GetName().c_str()));
+    else
+       return 1;
 }
 int TORTOISE_PARSER::getDTIBval()
 {

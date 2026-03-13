@@ -62,7 +62,7 @@ CUDAIMAGE::Pointer  CreateVirtualImg(CUDAIMAGE::Pointer img, int downsample_fact
     return virtual_img;
 }
 
-TransformType::Pointer  RegisterDWIToB0_cuda(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string phase, MeccSettings *mecc_settings, bool initialize,std::vector<float> lim_arr, TransformType::Pointer minit_trans )
+TransformType::Pointer  RegisterDWIToB0_cuda(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string phase, MeccSettings *mecc_settings, bool initialize,std::vector<float> lim_arr, int vol, TransformType::Pointer minit_trans )
 {    
 
     typedef itk::MattesMutualInformationImageToImageMetricv4Okan<ImageType3D,ImageType3D> MetricType;

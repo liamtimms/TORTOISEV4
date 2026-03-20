@@ -76,6 +76,11 @@ snapshot_params(const std::vector<std::vector<OkanQuadraticTransformType::Pointe
 // ============================================================
 // Test: identical params → metric = 0
 // ============================================================
+// The convergence metric (mean absolute change in rigid params across all volumes
+// and slices) is used by DIFFPREP::MotionAndEddy to decide whether the S2V epoch
+// loop has converged. Units are mixed: translations in mm, rotations in radians.
+// A metric of 0 means no parameters changed — the trivial convergence case.
+
 void test_convergence_metric_zero_when_unchanged()
 {
     int Nvols = 3, Nslices = 8;
@@ -90,6 +95,11 @@ void test_convergence_metric_zero_when_unchanged()
 // ============================================================
 // Test: known delta → metric matches expected
 // ============================================================
+// With a known +0.1mm Tx change on all transforms, the expected metric is
+// 0.1/6 ≈ 0.0167 (only 1 of 6 rigid params changed, averaged over all 6).
+// This verifies the averaging denominator includes all 6 rigid DOFs, not just
+// the changed ones — matching the actual DIFFPREP implementation.
+
 void test_convergence_metric_detects_change()
 {
     int Nvols = 2, Nslices = 4;
@@ -117,6 +127,11 @@ void test_convergence_metric_detects_change()
 // ============================================================
 // Test: threshold comparison matches DIFFPREP logic
 // ============================================================
+// Verifies the threshold comparison logic from DIFFPREP.cxx line 1600:
+// threshold=0 disables convergence checking entirely (loop runs all epochs).
+// A practical threshold of ~0.001 means "average rigid param change < 0.001"
+// which corresponds to sub-micron translation and sub-milliradian rotation changes.
+
 void test_convergence_threshold_comparison()
 {
     int Nvols = 2, Nslices = 4;

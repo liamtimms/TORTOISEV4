@@ -10,6 +10,11 @@
 // ============================================================
 // normalCDF_val tests
 // ============================================================
+// normalCDF_val converts Z-scores to probabilities for ComputeResidProb in the REPOL
+// outlier detection pipeline. Incorrect CDF values cause missed outlier volumes or
+// false flagging of good data. Clamping and NaN guards protect against corrupted
+// per-slice RMS values from failed registrations.
+
 void test_normalCDF_zero()
 {
     ASSERT_NEAR(normalCDF_val(0.0), 0.5, 1e-10);
@@ -60,6 +65,10 @@ void test_normalCDF_inf()
 // ============================================================
 // ComputeResidProb tests
 // ============================================================
+// ComputeResidProb maps per-volume RMS residuals to outlier probabilities in the
+// REPOL pipeline (DIFFPREP::PerformOutlierDetection). The agg parameter (0/1/2)
+// controls aggressiveness via empirical centering and scale constants. Each level shifts the decision boundary inward.
+
 void test_residprob_agg0()
 {
     // norm_x = (val - mu) / sigma = (2.0 - 1.0) / 1.0 = 1.0
@@ -91,6 +100,10 @@ void test_residprob_agg2()
 // ============================================================
 // log_gaussian tests
 // ============================================================
+// log_gaussian computes log-likelihood for EM clustering in DIFFPREP::EM().
+// Working in log-space avoids underflow when evaluating Gaussian likelihoods at
+// extreme RMS values (common in corrupted diffusion volumes with signal dropout).
+
 void test_log_gaussian_standard()
 {
     // log N(0; 0, 1) = -0.5 * log(2*pi) = -0.9189...
@@ -122,6 +135,10 @@ void test_log_gaussian_exp_matches_gaussian()
 // ============================================================
 // median tests
 // ============================================================
+// median is used for MAD (Median Absolute Deviation) in REPOL outlier detection.
+// MAD-based sigma = 1.4826 * median(|x - median(x)|) is robust to up to 50%
+// contamination, unlike standard deviation which breaks with a single outlier.
+
 void test_median_odd()
 {
     std::vector<float> v = {3, 1, 2};
@@ -144,6 +161,10 @@ void test_median_sorted()
 // ============================================================
 // round50 tests
 // ============================================================
+// round50 rounds b-values to the nearest multiple of 50 for shell binning in
+// TORTOISE::Process(). Incorrect rounding merges or splits shells, changing which
+// volumes are grouped together for motion correction and model fitting.
+
 void test_round50_exact()
 {
     ASSERT_EQ(round50(100), 100);
@@ -163,6 +184,9 @@ void test_round50_rounding()
 // ============================================================
 // average tests
 // ============================================================
+// Weighted average is used in the EM M-step to update cluster means and variances.
+// Incorrect weighting biases the inlier/outlier cluster separation in REPOL.
+
 void test_average_uniform_weights()
 {
     EigenVecType x(3); x << 2.0, 4.0, 6.0;

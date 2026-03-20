@@ -1434,37 +1434,33 @@ void DIFFPREP::MotionAndEddy()
 
 
     vnl_matrix<int> slspec;
+    int Nslice_for_slspec= native_native_raw_dwis[0]->GetLargestPossibleRegion().GetSize()[2];
+    if(slice_to_volume && this->my_json["SliceTiming"]!=json::value_t::null)
+    {
+        slspec= ParseJSONForSliceTiming(this->my_json);
+    }
+    else if(this->my_json["MultibandAccelerationFactor"]!=json::value_t::null)
+    {
+        int MB= this->my_json["MultibandAccelerationFactor"];
+        int Nexc= Nslice_for_slspec/MB;
+        slspec.set_size(Nexc,MB);
+        slspec.fill(0);
+        for(int k=0;k<Nslice_for_slspec;k++)
+        {
+            int r= k % Nexc;
+            int c= k/ Nexc;
+            slspec(r,c)=k;
+        }
+    }
+    else
+    {
+        slspec.set_size(Nslice_for_slspec,1);
+        for(int k=0;k<Nslice_for_slspec;k++)
+            slspec(k,0)=k;
+    }
+
     if(slice_to_volume)
     {
-        if(this->my_json["SliceTiming"]!=json::value_t::null)
-        {
-            slspec= ParseJSONForSliceTiming(this->my_json);
-        }
-        else
-        {
-            int Nslice= native_native_raw_dwis[0]->GetLargestPossibleRegion().GetSize()[2];
-            if(this->my_json["MultibandAccelerationFactor"]!=json::value_t::null)
-            {
-                int MB= this->my_json["MultibandAccelerationFactor"];
-                int Nexc= Nslice/MB;
-                slspec.set_size(Nexc,MB);
-                slspec.fill(0);
-                for(int k=0;k<Nslice;k++)
-                {
-                    int r= k % Nexc;
-                    int c= k/ Nexc;
-                    slspec(r,c)=k;
-                }
-            }
-            else
-            {
-                slspec.set_size(Nslice,1);
-                for(int k=0;k<Nslice;k++)
-                    slspec(k,0)=k;
-            }
-
-        }
-
         s2v_transformations.resize(Nvols);
     }
 
@@ -1645,15 +1641,99 @@ void DIFFPREP::MotionAndEddy()
 
 
              //Estimation and synthesization
+             // Compute per-slice rotated B-matrices accounting for inter-volume + S2V rotations
+             int Nslices = native_native_raw_dwis[0]->GetLargestPossibleRegion().GetSize()[2];
+             int Nexc_bmat = slspec.rows();
+             int MB_bmat = slspec.cols();
+
+             // per_slice_bmat[vol][slice_k] = rotated 6-element B-matrix row
+             std::vector<std::vector<vnl_vector<double>>> per_slice_bmat(Nvols);
+
+             // voxelwise_bmat[vol][element] = 3D image with per-voxel B-matrix values
+             std::vector<std::vector<ImageType3D::Pointer>> voxelwise_bmat(Nvols);
+
+             ImageType3D::SizeType bmat_sz = native_native_raw_dwis[0]->GetLargestPossibleRegion().GetSize();
+
+             for(int vol=0;vol<Nvols;vol++)
+             {
+                 per_slice_bmat[vol].resize(Nslices);
+
+                 // Extract inter-volume rotation from dwi_transforms[vol]
+                 vnl_matrix_fixed<double,3,3> R_vol;
+                 R_vol.set_identity();
+                 if(dwi_transforms[vol])
+                 {
+                     for(int t = dwi_transforms[vol]->GetNumberOfTransforms()-1; t>=0; t--)
+                     {
+                         auto *quad_trans = dynamic_cast<OkanQuadraticTransformType*>(
+                             dwi_transforms[vol]->GetNthTransform(t).GetPointer());
+                         if(quad_trans)
+                         {
+                             vnl_matrix_fixed<double,3,3> m(quad_trans->GetMatrix().GetVnlMatrix());
+                             R_vol = m.transpose() * R_vol;
+                         }
+                     }
+                     R_vol = R_vol.transpose();
+                 }
+
+                 // Create voxelwise B-matrix images for this volume
+                 voxelwise_bmat[vol].resize(6);
+                 for(int el=0;el<6;el++)
+                 {
+                     voxelwise_bmat[vol][el] = ImageType3D::New();
+                     voxelwise_bmat[vol][el]->SetRegions(native_native_raw_dwis[0]->GetLargestPossibleRegion());
+                     voxelwise_bmat[vol][el]->Allocate();
+                     voxelwise_bmat[vol][el]->FillBuffer(Bmatrix(vol,el));
+                     voxelwise_bmat[vol][el]->SetOrigin(native_native_raw_dwis[0]->GetOrigin());
+                     voxelwise_bmat[vol][el]->SetDirection(native_native_raw_dwis[0]->GetDirection());
+                     voxelwise_bmat[vol][el]->SetSpacing(native_native_raw_dwis[0]->GetSpacing());
+                 }
+
+                 // For each excitation, compute total rotation and rotated B-matrix
+                 for(int e=0; e<Nexc_bmat; e++)
+                 {
+                     vnl_matrix_fixed<double,3,3> R_total = R_vol;
+                     if(slice_to_volume && s2v_transformations.size() > (size_t)vol
+                        && s2v_transformations[vol].size() > (size_t)slspec(e,0)
+                        && s2v_transformations[vol][slspec(e,0)])
+                     {
+                         vnl_matrix_fixed<double,3,3> R_s2v(
+                             s2v_transformations[vol][slspec(e,0)]->GetMatrix().GetVnlMatrix());
+                         R_s2v = R_s2v.transpose();
+                         R_total = R_vol * R_s2v;
+                     }
+
+                     vnl_vector<double> rotated_row = RotateBMatrixVec(Bmatrix.get_row(vol), R_total);
+
+                     for(int kk=0; kk<MB_bmat; kk++)
+                     {
+                         int k = slspec(e,kk);
+                         per_slice_bmat[vol][k] = rotated_row;
+                         // Write into voxelwise images
+                         ImageType3D::IndexType ind3;
+                         ind3[2] = k;
+                         for(int j=0; j<(int)bmat_sz[1]; j++)
+                         {
+                             ind3[1] = j;
+                             for(int i=0; i<(int)bmat_sz[0]; i++)
+                             {
+                                 ind3[0] = i;
+                                 for(int el=0; el<6; el++)
+                                     voxelwise_bmat[vol][el]->SetPixel(ind3, rotated_row[el]);
+                             }
+                         }
+                     }
+                 }
+             }
+
              ImageType3D::Pointer TR_map=nullptr;
              {
-                 std::vector<std::vector<ImageType3D::Pointer> >dummyv;
                  std::vector<int> dummy;
                  DTIModel dti_estimator;
                  dti_estimator.SetBmatrix(Bmatrix);
                  dti_estimator.SetDWIData(eddy_s2v_replaced_raw_dwis);
                  dti_estimator.SetWeightImage(eddy_weight_img);
-                 dti_estimator.SetVoxelwiseBmatrix(dummyv);
+                 dti_estimator.SetVoxelwiseBmatrix(voxelwise_bmat);
                  dti_estimator.SetMaskImage(nullptr);
                  dti_estimator.SetVolIndicesForFitting(low_DT_indices);
                  dti_estimator.SetFittingMode("WLLS");
@@ -1675,7 +1755,7 @@ void DIFFPREP::MotionAndEddy()
                      mapmri_estimator.SetBmatrix(Bmatrix);
                      mapmri_estimator.SetDWIData(eddy_s2v_replaced_raw_dwis);
                      mapmri_estimator.SetWeightImage(eddy_weight_img);
-                     mapmri_estimator.SetVoxelwiseBmatrix(dummyv);
+                     mapmri_estimator.SetVoxelwiseBmatrix(voxelwise_bmat);
                      mapmri_estimator.SetMaskImage(b0_mask_img);
                      mapmri_estimator.SetVolIndicesForFitting(dummy);
                      mapmri_estimator.SetSmallDelta(small_delta);
@@ -1685,6 +1765,7 @@ void DIFFPREP::MotionAndEddy()
 
                  //All this is quite memory intensive. We should clear as soon as we can
                  eddy_s2v_replaced_raw_dwis.clear(); eddy_s2v_replaced_raw_dwis.resize(Nvols);
+                 voxelwise_bmat.clear();
                  if(outlier_replacement)
                  {
                      eddy_weight_img.clear(); eddy_weight_img.resize(Nvols);
@@ -1698,19 +1779,19 @@ void DIFFPREP::MotionAndEddy()
                      TORTOISE::EnableOMPThread();
                      int NITK= TORTOISE::GetAvailableITKThreadFor();
 
-                     // Synthesize artificial volume with the same bvec/bval
+                     // Synthesize artificial volume with per-slice rotated B-matrix
                      ImageType3D::Pointer synth_img=nullptr;
 
                      if(bvals[vol]<=55)
                      {
-                         synth_img= dti_estimator.SynthesizeDWI( Bmatrix.get_row(vol) );
+                         synth_img= dti_estimator.SynthesizeDWIPerSlice( per_slice_bmat[vol] );
                      }
                      else
                      {
                          if(MAPMRI_indices.size()>0)
-                             synth_img = mapmri_estimator.SynthesizeDWI( Bmatrix.get_row(vol) );
+                             synth_img = mapmri_estimator.SynthesizeDWIPerSlice( per_slice_bmat[vol] );
                          else
-                             synth_img= dti_estimator.SynthesizeDWI( Bmatrix.get_row(vol) );
+                             synth_img= dti_estimator.SynthesizeDWIPerSlice( per_slice_bmat[vol] );
                      }
 
                      eddy_s2v_replaced_synth_dwis[vol]=synth_img;
@@ -1766,6 +1847,24 @@ void DIFFPREP::MotionAndEddy()
                  bool s2v_warm_setting = RegistrationSettings::get().getValue<bool>(std::string("s2v_warm_start"));
                  bool s2v_ms = RegistrationSettings::get().getValue<bool>(std::string("s2v_multistart"));
 
+                 #ifdef USECUDA
+                 int s2v_NGPUs;
+                 cudaGetDeviceCount(&s2v_NGPUs);
+                 std::vector<int> s2v_cuda_device_ids;
+                 {
+                     cudaDeviceProp s2v_prop;
+                     for(int g=0; g<s2v_NGPUs; g++)
+                     {
+                         cudaGetDeviceProperties(&s2v_prop, g);
+                         std::string gnm = s2v_prop.name;
+                         if(gnm.find("Display") == std::string::npos)
+                             s2v_cuda_device_ids.push_back(g);
+                     }
+                 }
+                 s2v_NGPUs = s2v_cuda_device_ids.size();
+                 int s2v_Nt = omp_get_max_threads();
+                 #endif
+
                  // Sub-iteration loop (like EDDY's --s2v_niter)
                  int effective_s2v_niter = (s2v_ms && epoch == 1) ? 1 : s2v_niter; // No sub-iters for multistart epoch
                  for(int s2v_iter = 0; s2v_iter < effective_s2v_niter; s2v_iter++)
@@ -1780,38 +1879,77 @@ void DIFFPREP::MotionAndEddy()
                          (*stream)<<"S2V epoch "<<epoch<<" (sigma="<<sub_sigma<<", niter="<<effective_s2v_niter<<")"<<std::endl;
                      (*stream)<<"Done Slice-to-volume registering volume: " <<std::flush;
 
-                     #pragma omp parallel for
-                     for(int vol=0;vol<Nvols;vol++)
+                     bool use_multistart = (s2v_ms && epoch == 1 && s2v_iter == 0);
+
+                     if(use_multistart)
                      {
-                         TORTOISE::EnableOMPThread();
-
-                         ImageType3D::Pointer target= native_native_raw_dwis[vol];
-                         ImageType3D::Pointer native_synth_img =s2v_replaced_synth_dwis[vol] ;
-
-                         std::vector<float> signal_ranges = choose_range(target, native_synth_img,b0_mask_img);
-
-                         //for the first few epochs we only do rigid registration for sv2
-                         //for the last one, we also do quadratic
-                         bool do_eddy=true;
-                         if(epoch==1)
-                             do_eddy=false;
-
-                         if(s2v_ms && epoch == 1 && s2v_iter == 0)
-                             VolumeToSliceRegistrationWithMultistart(target, native_synth_img,slspec,signal_ranges,s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol);
-                         else
+                         // Multistart: CPU-only, full thread count
+                         #pragma omp parallel for
+                         for(int vol=0;vol<Nvols;vol++)
                          {
+                             TORTOISE::EnableOMPThread();
+                             ImageType3D::Pointer target= native_native_raw_dwis[vol];
+                             ImageType3D::Pointer native_synth_img =s2v_replaced_synth_dwis[vol];
+                             std::vector<float> signal_ranges = choose_range(target, native_synth_img,b0_mask_img);
+                             bool do_eddy=true;
+                             if(epoch==1) do_eddy=false;
+
+                             VolumeToSliceRegistrationWithMultistart(target, native_synth_img,slspec,signal_ranges,
+                                 s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol);
+
+                             #pragma omp critical
+                             { (*stream)<<vol<<", "<<std::flush; }
+                             TORTOISE::DisableOMPThread();
+                         }
+                     }
+                     else
+                     {
+                         // Normal S2V: GPU dispatch when available
+                         #ifdef USECUDA
+                         if(s2v_NGPUs > 0)
+                             omp_set_num_threads(s2v_NGPUs);
+                         #pragma omp parallel for schedule(static)
+                         #else
+                         #pragma omp parallel for
+                         #endif
+                         for(int vol=0;vol<Nvols;vol++)
+                         {
+                             TORTOISE::EnableOMPThread();
+                             ImageType3D::Pointer target= native_native_raw_dwis[vol];
+                             ImageType3D::Pointer native_synth_img =s2v_replaced_synth_dwis[vol];
+                             std::vector<float> signal_ranges = choose_range(target, native_synth_img,b0_mask_img);
+                             bool do_eddy=true;
+                             if(epoch==1) do_eddy=false;
+
                              #ifdef USECUDA
-                                 VolumeToSliceRegistration_cuda(target, native_synth_img,slspec,signal_ranges,s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol,warm,sub_sigma);
+                             if(s2v_NGPUs > 0)
+                             {
+                                 cudaSetDevice(s2v_cuda_device_ids[omp_get_thread_num() % s2v_NGPUs]);
+                                 VolumeToSliceRegistration_cuda(target, native_synth_img,slspec,signal_ranges,
+                                     s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol,warm,sub_sigma);
+                             }
+                             else
+                             {
+                                 VolumeToSliceRegistration(target, native_synth_img,slspec,signal_ranges,
+                                     s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol,warm,sub_sigma);
+                             }
                              #else
-                                 VolumeToSliceRegistration(target, native_synth_img,slspec,signal_ranges,s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol,warm,sub_sigma);
+                                 VolumeToSliceRegistration(target, native_synth_img,slspec,signal_ranges,
+                                     s2v_transformations[vol],do_eddy,this->PE_string, this->b0_mask_img,vol,warm,sub_sigma);
                              #endif
+
+                             #pragma omp critical
+                             { (*stream)<<vol<<", "<<std::flush; }
+                             TORTOISE::DisableOMPThread();
                          }
-                         #pragma omp critical
+                         #ifdef USECUDA
+                         if(s2v_NGPUs > 0)
                          {
-                             (*stream)<<vol<<", "<<std::flush;
+                             cudaSetDevice(0);
+                             omp_set_num_threads(s2v_Nt);
                          }
-                         TORTOISE::DisableOMPThread();
-                     } //for vol
+                         #endif
+                     }
                      (*stream)<<std::endl;
 
                      // Temporal regularization after each sub-iteration (like EDDY's --s2v_lambda)

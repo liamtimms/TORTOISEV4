@@ -31,6 +31,9 @@ static int tests_failed = 0;
         " at line " + std::to_string(__LINE__))
 
 // --- parse_float_schedule tests ---
+// Float schedules control --s2v_smoothing_schedule (sigma values per epoch).
+// Parsing errors here silently misconfigure the S2V smoothing, causing either
+// too much blur (lost resolution) or too little (failed registration convergence).
 
 void test_float_normal()
 {
@@ -85,6 +88,9 @@ void test_float_whitespace_in_tokens()
 }
 
 // --- parse_int_schedule tests ---
+// Int schedules control --mapmri_degree_schedule (MAPMRI basis order per epoch).
+// Wrong parsing could set the basis order too low (lost angular resolution in ODF)
+// or too high (overfitting noise in early epochs when alignment is still coarse).
 
 void test_int_normal()
 {
@@ -120,6 +126,9 @@ void test_int_mixed_valid_invalid()
 }
 
 // --- schedule_value tests ---
+// schedule_value provides the value for a given epoch index, repeating the last
+// value for epochs beyond the schedule length. This "hold last" behavior means
+// users can specify fewer values than epochs without unexpected resets to zero.
 
 void test_schedule_value_in_range()
 {

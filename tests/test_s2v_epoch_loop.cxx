@@ -84,6 +84,10 @@ static double compute_mean_change(
 // ============================================================
 // Test: single epoch baseline — no features, identity-like output
 // ============================================================
+// Establishes a baseline: single epoch, single sub-iteration, no smoothing, cold
+// start, identical images. All later epoch tests compare against this to verify
+// that added features (warm start, smoothing, convergence) improve or don't regress.
+
 void test_single_epoch_baseline()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -113,6 +117,11 @@ void test_single_epoch_baseline()
 // ============================================================
 // Test: warm_start across 2 epochs — epoch 2 starts from epoch 1
 // ============================================================
+// Mirrors the epoch loop in DIFFPREP::MotionAndEddy: epoch 2 warm-starts
+// from epoch 1's result. With a 1-voxel shifted image, epoch 1 should detect the
+// shift and epoch 2 should preserve (not discard) that detection. This is
+// analogous to FSL eddy's iterative refinement across --niter passes.
+
 void test_warm_start_across_epochs()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -171,6 +180,11 @@ void test_warm_start_across_epochs()
 // ============================================================
 // Test: smoothing schedule decreases across epochs
 // ============================================================
+// Verifies the --s2v_smoothing_schedule "2.0,1.0,0.0" is correctly parsed and
+// applied per-epoch, analogous to FSL eddy's --fwhm schedule. The decreasing
+// sigma widens the capture range in early epochs (coarse alignment) and refines
+// in later epochs (fine detail). Beyond-schedule epochs repeat the last value.
+
 void test_smoothing_schedule_decreases()
 {
     // Parse a schedule and verify epoch-by-epoch sigma values
@@ -211,6 +225,11 @@ void test_smoothing_schedule_decreases()
 // ============================================================
 // Test: s2v_niter=3 runs multiple sub-iterations
 // ============================================================
+// Simulates the sub-iteration loop from DIFFPREP::MotionAndEddy.
+// Each sub-iteration warm-starts from the previous one and linearly decreases
+// the smoothing sigma. Analogous to FSL eddy's --s2v_niter. The test verifies
+// all 3 passes produce finite transforms without divergence.
+
 void test_s2v_niter_multiple_passes()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -244,7 +263,7 @@ void test_s2v_niter_multiple_passes()
     int s2v_niter = 3;
     std::vector<TransformType::Pointer> s2v_trans;
 
-    // Simulate the sub-iteration loop from DIFFPREP.cxx lines 1770-1821
+    // Simulate the sub-iteration loop from DIFFPREP::MotionAndEddy
     float epoch_sigma = 0.0f;
     for (int s2v_iter = 0; s2v_iter < s2v_niter; s2v_iter++) {
         float sub_sigma = epoch_sigma * std::max(0.0f, 1.0f - (float)s2v_iter / s2v_niter);
@@ -268,6 +287,12 @@ void test_s2v_niter_multiple_passes()
 // ============================================================
 // Test: convergence stops loop early
 // ============================================================
+// Tests the --s2v_convergence_threshold logic from DIFFPREP::MotionAndEddy.
+// With identical images, transforms should converge to identity within 2 epochs.
+// The convergence metric (mean absolute rigid param change) is compared against
+// the threshold — when below, the loop exits early to save computation.
+// threshold=0.5 is generous to ensure convergence on this small synthetic image.
+
 void test_convergence_stops_early()
 {
     int sx = 16, sy = 16, sz = 8;

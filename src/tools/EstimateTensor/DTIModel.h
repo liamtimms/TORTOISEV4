@@ -32,6 +32,7 @@ public:
 
     void PerformFitting();
     ImageType3D::Pointer SynthesizeDWI(vnl_vector<double> bmat_vec);
+    ImageType3D::Pointer SynthesizeDWIPerSlice(std::vector<vnl_vector<double>> per_slice_bmat_vecs);
     ImageType3D::Pointer getCSImg(){return CS_img;}
     ImageType3D::Pointer getVFImg(){return VF_img;}
     void SetVFImage(ImageType3D::Pointer vf){this->VF_img=vf;}

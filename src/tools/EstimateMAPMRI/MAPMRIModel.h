@@ -33,6 +33,7 @@ public:
 
     void PerformFitting();
     ImageType3D::Pointer SynthesizeDWI(vnl_vector<double> bmat_vec);
+    ImageType3D::Pointer SynthesizeDWIPerSlice(std::vector<vnl_vector<double>> per_slice_bmat_vecs);
 
 private:
 

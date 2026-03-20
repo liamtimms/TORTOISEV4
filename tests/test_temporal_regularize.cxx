@@ -101,6 +101,12 @@ vnl_matrix<int> make_slspec(int Nexc, int MB)
 }
 
 // --- Tests ---
+// TemporalRegularize smooths S2V rigid parameters across excitation groups using
+// a [1,2,1]/4 moving-average kernel (interior) and [2,1]/3 at boundaries. This
+// suppresses high-frequency noise in per-slice transforms while preserving
+// genuine linear motion trends. Lambda blends between original (0) and smoothed
+// (1). The algorithm operates on excitation-group order, not slice order, because
+// that's the temporal acquisition sequence.
 
 void test_lambda_zero_no_change()
 {
@@ -159,6 +165,9 @@ void test_constant_input_unchanged()
     }
 }
 
+// Verifies the [1,2,1]/4 kernel weights: a step discontinuity (0→10 between groups
+// 2 and 3) should be smoothed at the transition but preserved at the boundaries.
+// This catches off-by-one errors in the kernel indexing.
 void test_step_function_smoothed()
 {
     // Step function: [0, 0, 0, 10, 10] in tx
@@ -203,6 +212,9 @@ void test_lambda_half_blends()
     ASSERT_NEAR(trans[1]->GetParameters()[0], 7.5, 1e-10);
 }
 
+// MB consistency: after smoothing, all slices in the same excitation group must
+// still have identical transforms. A bug here would create discontinuities between
+// simultaneously-acquired slices in the final corrected volume.
 void test_mb2_consistency()
 {
     // MB=2: both slices in each group should get the same params
@@ -226,6 +238,9 @@ void test_mb2_consistency()
     }
 }
 
+// Only rigid params (0-5: translations + rotations) should be smoothed. Eddy
+// current parameters (6-23) are spatially-varying and should not be temporally
+// regularized — eddy fields change with gradient direction, not with time.
 void test_non_rigid_params_unchanged()
 {
     // Only params 0-5 should be smoothed; params 6-23 should be unchanged
@@ -264,6 +279,9 @@ void test_non_rigid_params_unchanged()
     }
 }
 
+// A [1,2,1]/4 kernel exactly preserves linear trends at interior points because
+// (k-1 + 2k + k+1)/4 = k. This property ensures that genuine linear motion
+// (e.g., slow drift during a long scan) is not attenuated by the regularization.
 void test_linear_ramp_preserved()
 {
     // A linear ramp should be nearly preserved by the moving average

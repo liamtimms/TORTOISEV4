@@ -121,6 +121,12 @@ EMResult run_em(std::vector<float> rms_values, int K = 4, int niter = 500)
 // ============================================================
 // Test: EM separates two well-separated Gaussian clusters
 // ============================================================
+// The EM algorithm in DIFFPREP::EM clusters per-volume log-RMS residuals into
+// K=4 Gaussian components to separate inlier and outlier DWI volumes (REPOL).
+// This test uses 90 inlier + 10 outlier synthetic samples with 3σ separation.
+// The dominant cluster must capture ≥40% of the probability and concentrate near
+// the inlier mean. Failure here means REPOL would misclassify DWI volumes.
+
 void test_em_separates_two_clusters()
 {
     std::mt19937 rng(42);
@@ -163,6 +169,11 @@ void test_em_separates_two_clusters()
 // ============================================================
 // Test: single cluster (all inliers) — no spurious outlier split
 // ============================================================
+// When all volumes are clean (single true Gaussian), the EM should not split the
+// data into multiple clusters with comparable probability. The dominant cluster
+// mean should be near the true mean (2.0). Spurious splitting would cause REPOL
+// to flag good volumes as outliers, discarding usable diffusion data.
+
 void test_em_all_inliers()
 {
     std::mt19937 rng(123);
@@ -200,6 +211,11 @@ void test_em_all_inliers()
 // ============================================================
 // Test: ComputeResidProb threshold sensitivity across agg levels
 // ============================================================
+// Verifies the monotonic ordering: agg2 ≤ agg1 ≤ agg0 for any positive Z-score.
+// Higher aggressiveness must always produce lower (or equal) probability, giving
+// a stricter outlier criterion. At z=0 (at the mean), all levels should give
+// high probability (>0.9) — a volume matching the expected signal is never an outlier.
+
 void test_residprob_threshold_sensitivity()
 {
     float mu = 0.0, sigma = 1.0;
@@ -230,6 +246,11 @@ void test_residprob_threshold_sensitivity()
 // ============================================================
 // Test: RMS-to-probability pipeline detects obvious outlier
 // ============================================================
+// End-to-end test of the RMS→log→MAD→probability pipeline used in
+// DIFFPREP::PerformOutlierDetection. A 10x outlier (RMS=500 vs normal ~50) must
+// produce probability < 0.05 while normal values stay > 0.5. The MAD scale factor
+// 1.4826 converts MAD to an asymptotically normal σ estimate.
+
 void test_rms_to_probability_pipeline()
 {
     // Simulate per-slice RMS values: 20 normal, 1 outlier
@@ -269,6 +290,11 @@ void test_rms_to_probability_pipeline()
 // ============================================================
 // Test: MAD robustness to extreme outliers
 // ============================================================
+// MAD's breakdown point is 50%: it gives a valid σ estimate even with up to half
+// the data contaminated. Here 5/105 ≈ 5% contamination with extreme outliers
+// (value=100 vs σ=1). The σ estimate should remain near 1.0 and median near 0.0.
+// Standard deviation would be ~10x inflated, causing REPOL to miss all outliers.
+
 void test_mad_robustness()
 {
     std::mt19937 rng(42);

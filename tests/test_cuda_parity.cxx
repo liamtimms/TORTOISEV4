@@ -25,6 +25,11 @@
 // ============================================================
 // Test: CUDA warm_start initialization matches CPU logic
 // ============================================================
+// Both CPU and CUDA paths must implement the same warm_start guard:
+//   if(!warm_start || s2v_transformations.size() != sz[2]) reset to identity.
+// A mismatch would cause different registration results depending on whether
+// the user has a GPU, making S2V behavior non-reproducible across machines.
+
 void test_cuda_warm_start_matches_cpu()
 {
 #ifdef USECUDA
@@ -73,6 +78,11 @@ void test_cuda_warm_start_matches_cpu()
 // ============================================================
 // Test: CUDA smoothing path activates when sigma > 0
 // ============================================================
+// Known CPU/CUDA difference: CPU uses two-level registration (smoothed + unsmoothed),
+// CUDA applies a single Gaussian-smoothed pass. Results may differ when smoothing
+// is active, but both must produce finite outputs. This test only checks no-crash
+// and finite params, not numerical equivalence.
+
 void test_cuda_smoothing_applied()
 {
 #ifdef USECUDA
@@ -107,6 +117,11 @@ void test_cuda_smoothing_applied()
 // ============================================================
 // Test: CUDA function signature has warm_start and smoothing_sigma
 // ============================================================
+// Compile-time API check: VolumeToSliceRegistration_cuda must accept the same
+// warm_start and smoothing_sigma parameters as the CPU version. If the CUDA
+// header's signature drifts, this static_cast fails to compile. The #ifdef USECUDA
+// guard means this only runs on GPU-enabled builds.
+
 void test_cuda_signature_parity()
 {
 #ifdef USECUDA

@@ -1,0 +1,973 @@
+#!/bin/bash
+set -euo pipefail
+
+###############################################################################
+# tortoise_testing — DIFFPREP integration test battery
+#
+# Exercises the TORTOISE DIFFPREP motion/eddy/S2V/outlier-replacement pipeline
+# on real multi-shell DWI data. Each test adds one CLI feature so the user can
+# isolate each addition's effect. EPI distortion correction is disabled
+# throughout (--epi off).
+#
+# Tests run in parallel within each phase via GNU `parallel`. Core allocation
+# is managed automatically via default_system_settings.json.
+#
+# Usage:
+#   ./tortoise_testing <session_dwi_dir> [output_root] [test_range]
+#
+# Arguments:
+#   session_dwi_dir   BIDS dwi/ directory containing .nii.gz, .bval, .bvec, .json
+#   output_root       Where results are saved (default: ./tortoise_test_results)
+#   test_range        "1-3", "8", "all" (default: "all")
+#
+# Examples:
+#   ./tortoise_testing testing_data/sub-PretestSubject4triple/ses-still/dwi
+#   ./tortoise_testing testing_data/sub-PretestSubject4triple/ses-3yomotion/dwi ./results_motion
+#   ./tortoise_testing testing_data/sub-PretestSubject4triple/ses-still/dwi ./results_still "1-3"
+###############################################################################
+
+# ─── Usage / Help ────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'USAGE'
+Usage: tortoise_testing [options] <session_dwi_dir> [output_root] [test_range]
+
+Options:
+  --docker IMAGE        Run TORTOISE inside a Docker container using IMAGE
+  --docker-mount PATH   Mount root for the container (default: auto-detect from paths)
+  --docker-gpu          Use GPU binary (TORTOISEProcess_cuda) and pass --gpus all
+
+Arguments:
+  session_dwi_dir   BIDS dwi/ directory containing .nii.gz (or .nii), .bval, .bvec, .json
+  output_root       Where results are saved (default: ./tortoise_test_results)
+  test_range        Which tests to run: "all" (default), "1-3", "4", "8-12", etc.
+
+Test Battery (23 tests, 6 phases):
+  Phase 1 — Baseline eddy models (niter=0, single-pass register-to-b0) [Batch 1, j2]
+    01  p1_rigid_only           Rigid 6-DOF motion only
+    02  p1_quadratic_eddy       14-DOF motion + quadratic eddy (default model)
+
+  Phase 2 — Iterative refinement + feature activation (niter=4) [Batch 2, j4]
+    03  p2_quad_iterative       MAPMRI synth-target registration (1 epoch)
+    04  p2_quad_repol           + outlier detection/replacement
+    05  p2_quad_s2v             + slice-to-volume correction
+    06  p2_quad_s2v_repol       Full EDDY-equivalent baseline
+
+  Phase 3a — Isolated S2V knobs (test 06 + one flag each) [Batch 3, j4]
+    07  p3a_iso_smoothing       Coarse-to-fine S2V smoothing schedule
+    08  p3a_iso_subiters        Multiple S2V passes per epoch
+    09  p3a_iso_warm_start      Carry forward transforms across epochs
+    10  p3a_iso_temporal_reg    Temporal regularization across MB groups
+
+  Phase 3b — Cumulative S2V stacking (on test 06) [Batch 4, j5]
+    11  p3b_cum_smoothing       Smoothing
+    12  p3b_cum_subiters        + sub-iterations
+    13  p3b_cum_warm_start      + warm start
+    14  p3b_cum_temporal_reg    + temporal reg (fully-tuned)
+    15  p3b_cum_convergence     Extended niter=5 + convergence threshold
+
+  Phase 4 — Motion correction flags [Batch 5, j6]
+    16  p4_lmc_baseline         Large motion correction (test 06 base)
+    17  p4_s2v_ms_baseline      S2V multistart (test 06 base)
+    18  p4_lmc_ms_baseline      LMC + S2V multistart (test 06 base)
+    19  p4_lmc_tuned            Large motion correction (test 14 tuned)
+    20  p4_s2v_ms_tuned         S2V multistart (test 14 tuned)
+    21  p4_lmc_ms_tuned         LMC + S2V multistart (test 14 tuned)
+
+  Phase 5 — Advanced [Batch 6, j2]
+    22  p5_mapmri_schedule      Progressive MAPMRI complexity (degree 2->4->4->6)
+    23  p5_aggressive_repol     Aggressive outlier flagging
+
+USAGE
+    exit 0
+}
+
+# ─── Argument Parsing ────────────────────────────────────────────────────────
+
+DOCKER_IMAGE=""
+DOCKER_MOUNT=""
+DOCKER_GPU=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --docker)       [[ $# -ge 2 ]] || { echo "Error: --docker requires an image name"; exit 1; }
+                        DOCKER_IMAGE="$2"; shift 2 ;;
+        --docker-mount) [[ $# -ge 2 ]] || { echo "Error: --docker-mount requires a path"; exit 1; }
+                        DOCKER_MOUNT="$2"; shift 2 ;;
+        --docker-gpu)   DOCKER_GPU=1; shift ;;
+        --help|-h)      usage ;;
+        -*)             echo "Unknown flag: $1"; usage ;;
+        *)              break ;;  # positional args start
+    esac
+done
+
+if [[ $# -lt 1 ]]; then
+    echo "Error: session_dwi_dir is required."
+    usage
+fi
+
+DWI_DIR="$(realpath "$1")"
+OUTPUT_ROOT="$(realpath "${2:-./tortoise_test_results}")"
+TEST_RANGE="${3:-all}"
+
+# ─── Docker Volume Mounts ──────────────────────────────────────────────────
+
+DOCKER_VOLUMES=()
+if [[ -n "$DOCKER_IMAGE" ]]; then
+    if [[ -n "$DOCKER_MOUNT" ]]; then
+        DOCKER_VOLUMES=(-v "$DOCKER_MOUNT:$DOCKER_MOUNT")
+    else
+        DOCKER_VOLUMES=(-v "$DWI_DIR:$DWI_DIR" -v "$OUTPUT_ROOT:$OUTPUT_ROOT")
+    fi
+fi
+
+# ─── Session ID Extraction ──────────────────────────────────────────────────
+
+SESSION_ID=""
+IFS='/' read -ra path_parts <<< "$DWI_DIR"
+for part in "${path_parts[@]}"; do
+    [[ "$part" == ses-* ]] && SESSION_ID="$part"
+done
+[[ -z "$SESSION_ID" ]] && SESSION_ID="unknown_session"
+
+# ─── Locate the DWI file and sidecars ──────────────────────────────────────
+
+DWI=""
+for ext in .nii.gz .nii; do
+    candidate="$(find "$DWI_DIR" -maxdepth 1 -name "*${ext}" -not -name "*._*" | head -1)"
+    if [[ -n "$candidate" ]]; then
+        DWI="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$DWI" ]]; then
+    echo "Error: No .nii.gz or .nii file found in $DWI_DIR"
+    exit 1
+fi
+
+# Derive sidecar paths from the DWI filename
+DWI_BASE="${DWI%.nii.gz}"
+DWI_BASE="${DWI_BASE%.nii}"
+BVAL="${DWI_BASE}.bval"
+BVEC="${DWI_BASE}.bvec"
+JSON="${DWI_BASE}.json"
+
+echo "DWI file:  $DWI"
+
+missing_sidecars=0
+for f in "$BVAL" "$BVEC" "$JSON"; do
+    if [[ ! -f "$f" ]]; then
+        echo "Error: Missing sidecar: $f"
+        missing_sidecars=1
+    fi
+done
+if [[ $missing_sidecars -eq 1 ]]; then
+    exit 1
+fi
+
+echo "Sidecars:  .bval .bvec .json — OK"
+echo "Session:   $SESSION_ID"
+
+# ─── Input Validation Warnings ─────────────────────────────────────────────
+
+# Check for SliceTiming in JSON
+if ! grep -q '"SliceTiming"' "$JSON" 2>/dev/null; then
+    echo "WARNING: JSON missing SliceTiming — S2V tests (05-23) need it for meaningful results."
+    echo "         Also check for MultibandAccelerationFactor."
+fi
+
+# Check volume count
+NVOLS=$(wc -w < "$BVAL" 2>/dev/null || echo 0)
+echo "Volumes:   $NVOLS"
+if [[ "$NVOLS" -lt 20 ]]; then
+    echo "WARNING: <20 volumes — DIFFPREP will auto-disable s2v and repol (DIFFPREP.cxx:1414)."
+fi
+
+# ─── Auto-detect Binary ───────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY=""
+
+if [[ -n "$DOCKER_IMAGE" ]]; then
+    # Docker mode: binary lives inside the container, not on the host
+    if [[ -n "$DOCKER_GPU" ]]; then
+        BINARY="TORTOISEProcess_cuda"
+    else
+        BINARY="TORTOISEProcess"
+    fi
+    echo "Binary:    $BINARY (Docker: $DOCKER_IMAGE)"
+    echo "Docker:    mounts: ${DOCKER_VOLUMES[*]}"
+
+    # Preflight: verify image works before committing to a long run
+    echo -n "Preflight: "
+    set +o pipefail
+    preflight_out="$(docker run --rm "$DOCKER_IMAGE" "$BINARY" 2>&1 | head -5)"
+    set -o pipefail
+    if echo "$preflight_out" | grep -q "COMMAND:"; then
+        echo "OK — $DOCKER_IMAGE responds"
+    else
+        echo "FAILED — cannot run '$BINARY' in image '$DOCKER_IMAGE'"
+        echo "Check: docker run --rm $DOCKER_IMAGE $BINARY"
+        exit 1
+    fi
+else
+    # Local mode: auto-detect binary from build directories
+    for search_dir in "$SCRIPT_DIR" "$SCRIPT_DIR/.."; do
+        if [[ -x "${search_dir}/bin/TORTOISEProcess_cuda" ]]; then
+            BINARY="$(realpath "${search_dir}/bin/TORTOISEProcess_cuda")"
+            echo "Binary:    TORTOISEProcess_cuda (GPU) — $BINARY"
+            break
+        elif [[ -x "${search_dir}/bin/TORTOISEProcess" ]]; then
+            BINARY="$(realpath "${search_dir}/bin/TORTOISEProcess")"
+            echo "Binary:    TORTOISEProcess (CPU) — $BINARY"
+            break
+        fi
+    done
+    if [[ -z "$BINARY" ]]; then
+        echo "Error: Neither TORTOISEProcess_cuda nor TORTOISEProcess found in"
+        echo "  ${SCRIPT_DIR}/bin/ or ${SCRIPT_DIR}/../bin/"
+        echo "Build first: cd TORTOISEV4 && cmake . && make -j 16"
+        exit 1
+    fi
+fi
+
+# ─── Check for GNU parallel ────────────────────────────────────────────────
+
+if ! command -v parallel &>/dev/null; then
+    echo "WARNING: GNU parallel not found. Tests will run sequentially."
+    echo "         Install: sudo apt install parallel"
+    HAS_PARALLEL=0
+else
+    HAS_PARALLEL=1
+    # Suppress citation notice
+    mkdir -p ~/.parallel
+    touch ~/.parallel/will-cite 2>/dev/null || true
+fi
+
+# ─── Test Definitions ──────────────────────────────────────────────────────
+
+# Common flags for every test (applied during the per-test run, not golden preproc)
+COMMON="--epi off --drift off --denoising for_reg --step motioneddy"
+
+TEST_NAMES=(
+    # Phase 1: Baselines (niter=0)
+    "test_01_p1_rigid_only"
+    "test_02_p1_quadratic_eddy"
+    # Phase 2: Iterative refinement (niter=4)
+    "test_03_p2_quad_iterative"
+    "test_04_p2_quad_repol"
+    "test_05_p2_quad_s2v"
+    "test_06_p2_quad_s2v_repol"
+    # Phase 3a: Isolated S2V knobs (test 06 + one flag)
+    "test_07_p3a_iso_smoothing"
+    "test_08_p3a_iso_subiters"
+    "test_09_p3a_iso_warm_start"
+    "test_10_p3a_iso_temporal_reg"
+    # Phase 3b: Cumulative S2V stacking
+    "test_11_p3b_cum_smoothing"
+    "test_12_p3b_cum_subiters"
+    "test_13_p3b_cum_warm_start"
+    "test_14_p3b_cum_temporal_reg"
+    "test_15_p3b_cum_convergence"
+    # Phase 4: Motion correction
+    "test_16_p4_lmc_baseline"
+    "test_17_p4_s2v_ms_baseline"
+    "test_18_p4_lmc_ms_baseline"
+    "test_19_p4_lmc_tuned"
+    "test_20_p4_s2v_ms_tuned"
+    "test_21_p4_lmc_ms_tuned"
+    # Phase 5: Advanced
+    "test_22_p5_mapmri_schedule"
+    "test_23_p5_aggressive_repol"
+    # Phase 6: Kitchen sink
+    "test_24_p6_kitchen_sink"
+)
+
+TEST_DESCS=(
+    "Rigid 6-DOF motion only"
+    "14-DOF motion + quadratic eddy"
+    "MAPMRI synth-target registration (1 epoch)"
+    "Quadratic + outlier detection/replacement"
+    "Quadratic + slice-to-volume correction"
+    "Full EDDY-equivalent baseline (s2v + repol)"
+    "Coarse-to-fine S2V smoothing schedule (isolated)"
+    "Multiple S2V passes per epoch (isolated)"
+    "Carry forward transforms across epochs (isolated)"
+    "Temporal regularization across MB groups (isolated)"
+    "Smoothing (cumulative)"
+    "Smoothing + sub-iterations (cumulative)"
+    "Smoothing + sub-iters + warm start (cumulative)"
+    "Fully-tuned S2V (cumulative)"
+    "Extended convergence (niter=5 + threshold)"
+    "Large motion correction (test 06 baseline)"
+    "S2V multistart (test 06 baseline)"
+    "LMC + S2V multistart (test 06 baseline)"
+    "Large motion correction (test 14 tuned)"
+    "S2V multistart (test 14 tuned)"
+    "LMC + S2V multistart (test 14 tuned)"
+    "Progressive MAPMRI complexity (degree 2->4->4->6)"
+    "Aggressive outlier flagging"
+    "Kitchen sink: LMC+ms+warm+subiters+convergence+aggr_repol+b0_id=0"
+)
+
+# Base flags for test 06 (used by Phase 3+)
+BASE06="-c quadratic --niter 4 --s2v 1 --repol 1"
+# Fully-tuned flags from test 14
+TUNED14="$BASE06 --s2v_smoothing_schedule 1.0,0.5,0.0 --s2v_niter 3 --s2v_warm_start 1 --s2v_lambda 0.5"
+
+TEST_FLAGS=(
+    # Phase 1
+    "-c rigid --niter 0 --s2v 0 --repol 0"
+    "-c quadratic --niter 0 --s2v 0 --repol 0"
+    # Phase 2
+    "-c quadratic --niter 4 --s2v 0 --repol 0"
+    "-c quadratic --niter 4 --s2v 0 --repol 1"
+    "-c quadratic --niter 4 --s2v 1 --repol 0"
+    "$BASE06"
+    # Phase 3a: Isolated (test 06 + one flag)
+    "$BASE06 --s2v_smoothing_schedule 1.0,0.5,0.0"
+    "$BASE06 --s2v_niter 3"
+    "$BASE06 --s2v_warm_start 1"
+    "$BASE06 --s2v_lambda 0.5"
+    # Phase 3b: Cumulative stacking
+    "$BASE06 --s2v_smoothing_schedule 1.0,0.5,0.0"
+    "$BASE06 --s2v_smoothing_schedule 1.0,0.5,0.0 --s2v_niter 3"
+    "$BASE06 --s2v_smoothing_schedule 1.0,0.5,0.0 --s2v_niter 3 --s2v_warm_start 1"
+    "$TUNED14"
+    "-c quadratic --niter 5 --s2v 1 --repol 1 --s2v_smoothing_schedule 1.0,0.75,0.5,0.25,0.0 --s2v_niter 3 --s2v_warm_start 1 --s2v_lambda 0.5 --s2v_convergence_threshold 0.001"
+    # Phase 4: Motion correction
+    "$BASE06 --large_motion_correction 1"
+    "$BASE06 --s2v_multistart 1"
+    "$BASE06 --large_motion_correction 1 --s2v_multistart 1"
+    "$TUNED14 --large_motion_correction 1"
+    "$TUNED14 --s2v_multistart 1"
+    "$TUNED14 --large_motion_correction 1 --s2v_multistart 1"
+    # Phase 5: Advanced
+    "$TUNED14 --mapmri_degree_schedule 2,4,4,6"
+    "$TUNED14 --outlier_replacement_mode aggressive"
+    # Phase 6: Kitchen sink
+    "-c quadratic --niter 5 --s2v 1 --repol 1 --s2v_smoothing_schedule 1.0,0.75,0.5,0.25,0.0 --s2v_niter 3 --s2v_warm_start 1 --s2v_convergence_threshold 0.001 --large_motion_correction 1 --s2v_multistart 1 --outlier_replacement_mode aggressive --b0_id 0"
+)
+
+NUM_TESTS=${#TEST_NAMES[@]}
+
+# Batch definitions: "batch_name:j_count:test_numbers..."
+BATCHES=(
+    "Phase_1:2:1 2"
+    "Phase_2:4:3 4 5 6"
+    "Phase_3a:4:7 8 9 10"
+    "Phase_3b:5:11 12 13 14 15"
+    "Phase_4:6:16 17 18 19 20 21"
+    "Phase_5:2:22 23"
+    "Phase_6:1:24"
+)
+
+# ─── Parse Test Range ──────────────────────────────────────────────────────
+
+parse_test_range() {
+    local range="$1"
+    local max="$2"
+    local result=()
+
+    if [[ "$range" == "all" ]]; then
+        for ((i=1; i<=max; i++)); do
+            result+=("$i")
+        done
+    else
+        # Split on commas
+        IFS=',' read -ra parts <<< "$range"
+        for part in "${parts[@]}"; do
+            part="$(echo "$part" | tr -d ' ')"
+            if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                local start="${BASH_REMATCH[1]}"
+                local end="${BASH_REMATCH[2]}"
+                for ((i=start; i<=end && i<=max; i++)); do
+                    result+=("$i")
+                done
+            elif [[ "$part" =~ ^[0-9]+$ ]]; then
+                if [[ "$part" -ge 1 && "$part" -le "$max" ]]; then
+                    result+=("$part")
+                fi
+            else
+                echo "Error: Invalid test range component: '$part'"
+                exit 1
+            fi
+        done
+    fi
+
+    echo "${result[@]}"
+}
+
+TESTS_TO_RUN=($(parse_test_range "$TEST_RANGE" "$NUM_TESTS"))
+
+if [[ ${#TESTS_TO_RUN[@]} -eq 0 ]]; then
+    echo "Error: No valid tests selected from range '$TEST_RANGE'"
+    exit 1
+fi
+
+echo "Tests:     ${TESTS_TO_RUN[*]} (${#TESTS_TO_RUN[@]} of $NUM_TESTS)"
+
+# ─── Create Output Structure ───────────────────────────────────────────────
+
+mkdir -p "$OUTPUT_ROOT/logs"
+TIMING_FILE="$OUTPUT_ROOT/timing.tsv"
+SUMMARY_FILE="$OUTPUT_ROOT/summary.txt"
+
+# Initialize timing file if it doesn't exist
+if [[ ! -f "$TIMING_FILE" ]]; then
+    printf "test_name\texit_code\telapsed_seconds\n" > "$TIMING_FILE"
+fi
+
+# ─── Core Control ──────────────────────────────────────────────────────────
+
+RESERVED_CORES=${RESERVED_CORES:-0}
+DOCKER_CPUS=""
+
+if [[ -n "$DOCKER_IMAGE" ]]; then
+    # Docker mode: core control via --cpus flag (image has PercentOfCpuCoresToUse=1.0)
+    ORIGINAL_SETTINGS=""
+    trap 'rm -f "${TEST_DEFS_FILE:-}"' EXIT
+    echo "Settings:  Docker --cpus (image handles PercentOfCpuCoresToUse internally)"
+else
+    # Local mode: core control via settings JSON
+    SETTINGS_JSON="${SCRIPT_DIR}/../settings/system_settings/default_system_settings.json"
+    if [[ ! -f "$SETTINGS_JSON" ]]; then
+        SETTINGS_JSON="${SCRIPT_DIR}/settings/system_settings/default_system_settings.json"
+    fi
+
+    if [[ -f "$SETTINGS_JSON" ]]; then
+        SETTINGS_JSON="$(realpath "$SETTINGS_JSON")"
+        ORIGINAL_SETTINGS="$(cat "$SETTINGS_JSON")"
+        trap 'echo "$ORIGINAL_SETTINGS" > "$SETTINGS_JSON"; echo "[cores] Restored original settings"; rm -f "${TEST_DEFS_FILE:-}"' EXIT
+        echo "Settings:  $SETTINGS_JSON"
+    else
+        ORIGINAL_SETTINGS=""
+        echo "WARNING: default_system_settings.json not found — skipping core control"
+    fi
+fi
+
+set_cores_per_process() {
+    local n_parallel="$1"
+    local total_cores
+    total_cores=$(nproc)
+    local usable_cores=$((total_cores - RESERVED_CORES))
+    if [[ $usable_cores -lt $n_parallel ]]; then
+        usable_cores=$n_parallel
+    fi
+    local cores_each=$((usable_cores / n_parallel))
+
+    if [[ -n "$DOCKER_IMAGE" ]]; then
+        DOCKER_CPUS="$cores_each"
+        export DOCKER_CPUS
+        echo "  [cores] Docker --cpus=$DOCKER_CPUS ($total_cores total, $RESERVED_CORES reserved)"
+    else
+        if [[ -z "$ORIGINAL_SETTINGS" ]]; then
+            return
+        fi
+        local perc
+        perc=$(printf '%.2f' "$(echo "scale=4; $usable_cores / ($total_cores * $n_parallel)" | bc)")
+        cat > "$SETTINGS_JSON" <<JSONEOF
+{
+    "_comment": "Temporarily reduced for parallel testing ($n_parallel processes, $RESERVED_CORES reserved)",
+    "PercentOfCpuCoresToUse": $perc
+}
+JSONEOF
+        echo "  [cores] Set PercentOfCpuCoresToUse=$perc ($total_cores total, $RESERVED_CORES reserved, ~$cores_each per process)"
+    fi
+}
+
+restore_cores() {
+    if [[ -n "$DOCKER_IMAGE" ]]; then
+        DOCKER_CPUS=""
+    elif [[ -n "$ORIGINAL_SETTINGS" ]]; then
+        echo "$ORIGINAL_SETTINGS" > "$SETTINGS_JSON"
+    fi
+}
+
+# ─── Docker/Local Binary Wrapper ──────────────────────────────────────────
+
+run_binary() {
+    if [[ -n "$DOCKER_IMAGE" ]]; then
+        docker run --rm \
+            "${DOCKER_VOLUMES[@]}" \
+            -u "$(id -u):$(id -g)" \
+            --workdir "$OUTPUT_ROOT" \
+            ${DOCKER_CPUS:+--cpus "$DOCKER_CPUS"} \
+            ${DOCKER_GPU:+--gpus all} \
+            "$DOCKER_IMAGE" \
+            "$BINARY" "$@"
+    else
+        "$BINARY" "$@"
+    fi
+}
+
+# ─── Helper Functions ──────────────────────────────────────────────────────
+
+format_time() {
+    local secs="$1"
+    local mins=$((secs / 60))
+    local remainder=$((secs % 60))
+    if [[ $mins -gt 60 ]]; then
+        local hrs=$((mins / 60))
+        mins=$((mins % 60))
+        printf "%dh%02dm%02ds" "$hrs" "$mins" "$remainder"
+    else
+        printf "%dm%02ds" "$mins" "$remainder"
+    fi
+}
+
+# Find the _proc files in golden_preproc. The pipeline creates a subfolder
+# structure under temp_folder; we need to locate the actual _proc files.
+find_golden_proc_dir() {
+    local golden="$1"
+    # The _proc files live inside a subject-specific subfolder under golden_preproc
+    local proc_dir
+    proc_dir="$(find "$golden" -name "*_proc.nii" -printf '%h\n' 2>/dev/null | head -1)"
+    if [[ -z "$proc_dir" ]]; then
+        echo ""
+        return
+    fi
+    echo "$proc_dir"
+}
+
+prepare_test_folder() {
+    local test_dir="$1"
+    local golden_proc_dir="$2"
+
+    # If the test dir already has _proc files, skip copy
+    if find "$test_dir" -maxdepth 1 -name "*_proc.nii" 2>/dev/null | grep -q .; then
+        echo "  [prep] _proc files already present in $test_dir, skipping copy"
+        return 0
+    fi
+
+    mkdir -p "$test_dir"
+
+    # Copy _proc files, metadata, and noise map directly into test_dir
+    for pattern in "*_proc.nii" "*_proc.bmtxt" "*_proc.json" "*_noise.nii"; do
+        for f in "${golden_proc_dir}"/$pattern; do
+            if [[ -f "$f" ]]; then
+                cp "$f" "$test_dir/"
+            fi
+        done
+    done
+
+    # Copy logs directory if it exists (pipeline checks for it)
+    if [[ -d "${golden_proc_dir}/logs" ]]; then
+        cp -r "${golden_proc_dir}/logs" "$test_dir/"
+    fi
+
+    echo "  [prep] Copied golden _proc files to $test_dir"
+}
+
+check_outputs() {
+    local working_dir="$1"
+    local output_dir="$2"
+    local flags="$3"
+    local status=0
+
+    # moteddy output — check working dir for intermediates
+    if ! find "$working_dir" -name "*_moteddy.nii" 2>/dev/null | grep -q .; then
+        echo "  [MISSING] *_moteddy.nii in working dir"
+        status=1
+    fi
+    if ! find "$working_dir" -name "*_moteddy_transformations.txt" 2>/dev/null | grep -q .; then
+        echo "  [MISSING] *_moteddy_transformations.txt in working dir"
+        status=1
+    fi
+
+    # S2V transforms (when --s2v 1)
+    if echo "$flags" | grep -q -- "--s2v 1"; then
+        if ! find "$working_dir" -name "*_s2v_transformations.txt" 2>/dev/null | grep -q .; then
+            echo "  [MISSING] *_s2v_transformations.txt (expected with --s2v 1)"
+            status=1
+        fi
+    fi
+
+    # Outlier map (when --repol 1)
+    if echo "$flags" | grep -q -- "--repol 1"; then
+        if ! find "$working_dir" -name "*_native_inclusion.nii" 2>/dev/null | grep -q .; then
+            echo "  [MISSING] *_native_inclusion.nii (expected with --repol 1)"
+            status=1
+        fi
+    fi
+
+    # b0 quad reference
+    if ! find "$working_dir" -name "blip_up_b0_quad.nii" 2>/dev/null | grep -q .; then
+        echo "  [NOTE] blip_up_b0_quad.nii not found (may be in subfolder)"
+    fi
+
+    # Check output dir for final output
+    if [[ -d "$output_dir" ]]; then
+        if ! find "$output_dir" -name "*.nii" 2>/dev/null | grep -q .; then
+            echo "  [NOTE] No .nii files in output dir yet"
+        fi
+    fi
+
+    return $status
+}
+
+# ─── Phase 0: Golden Preprocessing ────────────────────────────────────────
+
+GOLDEN_DIR="$OUTPUT_ROOT/golden_preproc"
+
+run_golden_preproc() {
+    echo ""
+    echo "================================================================"
+    echo "Phase 0: Golden Preprocessing"
+    echo "================================================================"
+    echo "Running Import + Denoising + Gibbs with correction_mode=off"
+    echo "This avoids repeating the ~20-30 min denoising/Gibbs for every test."
+    echo ""
+
+    mkdir -p "$GOLDEN_DIR"
+
+    local log_file="$OUTPUT_ROOT/logs/golden_preproc.log"
+    local start_time=$SECONDS
+
+    echo "Command:"
+    echo "  $BINARY -u $DWI --epi off --drift off --denoising for_reg \\"
+    echo "    --correction_mode off --niter 0 --s2v 0 --repol 0 \\"
+    echo "    --temp_folder $GOLDEN_DIR"
+    echo ""
+
+    set +e
+    run_binary -u "$DWI" --epi off --drift off --denoising for_reg \
+        --correction_mode off --niter 0 --s2v 0 --repol 0 \
+        --temp_folder "$GOLDEN_DIR" \
+        2>&1 | tee "$log_file"
+    local exit_code=$?
+    set -e
+
+    local elapsed=$(( SECONDS - start_time ))
+    echo ""
+    echo "Golden preprocessing: exit_code=$exit_code, elapsed=$(format_time $elapsed)"
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "ERROR: Golden preprocessing failed. Cannot continue."
+        exit 1
+    fi
+
+    # Verify _proc files were created
+    local proc_dir
+    proc_dir="$(find_golden_proc_dir "$GOLDEN_DIR")"
+    if [[ -z "$proc_dir" ]]; then
+        echo "ERROR: Golden preprocessing completed but no *_proc.nii found."
+        echo "Contents of $GOLDEN_DIR:"
+        find "$GOLDEN_DIR" -type f | head -20
+        exit 1
+    fi
+
+    echo "Golden _proc files in: $proc_dir"
+    printf "golden_preproc\t%d\t%d\n" "$exit_code" "$elapsed" >> "$TIMING_FILE"
+}
+
+# Only run golden preproc if _proc files don't already exist
+GOLDEN_PROC_DIR="$(find_golden_proc_dir "$GOLDEN_DIR")"
+if [[ -z "$GOLDEN_PROC_DIR" ]]; then
+    run_golden_preproc
+    GOLDEN_PROC_DIR="$(find_golden_proc_dir "$GOLDEN_DIR")"
+else
+    echo ""
+    echo "Golden preprocessing already done: $GOLDEN_PROC_DIR"
+fi
+
+if [[ -z "$GOLDEN_PROC_DIR" ]]; then
+    echo "ERROR: Cannot locate golden _proc files. Aborting."
+    exit 1
+fi
+
+# ─── Single Test Runner ───────────────────────────────────────────────────
+# This function runs one test. It is called directly in sequential mode
+# or exported and invoked by GNU parallel.
+
+run_single_test() {
+    # Source test definitions (arrays can't be exported to parallel subprocesses)
+    if [[ -n "${TEST_DEFS_FILE:-}" && -f "$TEST_DEFS_FILE" ]]; then
+        source "$TEST_DEFS_FILE"
+    fi
+    local test_num="$1"
+    local idx=$((test_num - 1))
+    local name="${TEST_NAMES[$idx]}"
+    local desc="${TEST_DESCS[$idx]}"
+    local flags="${TEST_FLAGS[$idx]}"
+
+    local working_dir="$OUTPUT_ROOT/working_${name}"
+    local output_dir="$OUTPUT_ROOT/${name}"
+    local output_file="$output_dir/${SESSION_ID}_${name}.nii"
+    local log_file="$OUTPUT_ROOT/logs/${name}.log"
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────────"
+    echo "Test $test_num: $name"
+    echo "  $desc"
+    echo "  Flags: $flags"
+    echo "  Working dir: $working_dir"
+    echo "  Output dir:  $output_dir"
+    echo "────────────────────────────────────────────────────────────────"
+
+    mkdir -p "$working_dir"
+    mkdir -p "$output_dir"
+
+    # Prepare: copy golden _proc files into working dir
+    prepare_test_folder "$working_dir" "$GOLDEN_PROC_DIR"
+
+    # Build and display the command
+    echo ""
+    echo "Command:"
+    echo "  $BINARY -u $DWI $COMMON $flags --temp_folder $working_dir -o $output_file"
+    echo ""
+
+    # Run the test
+    local start_time=$SECONDS
+    set +e
+    run_binary -u "$DWI" $COMMON $flags --temp_folder "$working_dir" -o "$output_file" \
+        2>&1 | tee "$log_file"
+    local exit_code=$?
+    set -e
+
+    local elapsed=$(( SECONDS - start_time ))
+    local elapsed_str
+    elapsed_str="$(format_time $elapsed)"
+
+    # Check outputs
+    local output_status="OK"
+    if [[ $exit_code -ne 0 ]]; then
+        output_status="FAIL (exit $exit_code)"
+    else
+        if ! check_outputs "$working_dir" "$output_dir" "$flags"; then
+            output_status="WARN (missing outputs)"
+        fi
+    fi
+
+    # Record to timing file (atomic append)
+    printf "%s\t%d\t%d\n" "$name" "$exit_code" "$elapsed" >> "$TIMING_FILE"
+
+    echo ""
+    echo "Test $test_num ($name): $output_status — $elapsed_str"
+
+    return $exit_code
+}
+
+# Write test definitions to a temp file so GNU parallel subprocesses can source them
+# (Bash arrays cannot be exported to subprocesses)
+TEST_DEFS_FILE="$(mktemp "${OUTPUT_ROOT}/.test_defs.XXXXXX")"
+{
+    declare -p TEST_NAMES
+    declare -p TEST_DESCS
+    declare -p TEST_FLAGS
+    declare -p NUM_TESTS
+    declare -p DOCKER_VOLUMES
+} > "$TEST_DEFS_FILE"
+export TEST_DEFS_FILE
+
+# Export everything needed by GNU parallel subprocesses
+export -f run_single_test prepare_test_folder check_outputs format_time find_golden_proc_dir run_binary
+export OUTPUT_ROOT SESSION_ID GOLDEN_PROC_DIR BINARY DWI COMMON TIMING_FILE
+export DOCKER_IMAGE DOCKER_GPU DOCKER_CPUS
+
+# ─── Batch Execution ──────────────────────────────────────────────────────
+
+run_batch() {
+    local batch_name="$1"
+    shift
+    local test_nums=("$@")
+    local n_parallel=${#test_nums[@]}
+
+    echo ""
+    echo "================================================================"
+    echo "Batch: $batch_name (${#test_nums[@]} tests, j${n_parallel})"
+    echo "Tests: ${test_nums[*]}"
+    echo "================================================================"
+
+    if [[ $n_parallel -eq 1 ]]; then
+        # Single test — run directly at full cores
+        run_single_test "${test_nums[0]}"
+        return $?
+    fi
+
+    set_cores_per_process "$n_parallel"
+
+    if [[ $HAS_PARALLEL -eq 1 ]]; then
+        set +e
+        printf '%s\n' "${test_nums[@]}" | \
+            parallel -j"$n_parallel" --line-buffer --halt never \
+                run_single_test {}
+        local batch_exit=$?
+        set -e
+    else
+        # Sequential fallback
+        local batch_exit=0
+        for t in "${test_nums[@]}"; do
+            set +e
+            run_single_test "$t"
+            local rc=$?
+            set -e
+            if [[ $rc -ne 0 ]]; then
+                batch_exit=$rc
+            fi
+        done
+    fi
+
+    restore_cores
+
+    return $batch_exit
+}
+
+# ─── Main: Run Batches ────────────────────────────────────────────────────
+
+echo ""
+echo "================================================================"
+echo "Running ${#TESTS_TO_RUN[@]} test(s): ${TESTS_TO_RUN[*]}"
+echo "Output root: $OUTPUT_ROOT"
+echo "Session ID:  $SESSION_ID"
+echo "Parallel:    $(if [[ $HAS_PARALLEL -eq 1 ]]; then echo "GNU parallel available"; else echo "sequential (parallel not found)"; fi)"
+echo "================================================================"
+
+# Build a lookup set for quick membership checks
+declare -A TESTS_SELECTED
+for t in "${TESTS_TO_RUN[@]}"; do
+    TESTS_SELECTED[$t]=1
+done
+
+# Track results across all batches
+declare -A RESULTS
+declare -A ELAPSED_TIMES
+
+for batch_def in "${BATCHES[@]}"; do
+    IFS=':' read -r batch_name batch_j batch_tests <<< "$batch_def"
+    read -ra all_batch_tests <<< "$batch_tests"
+
+    # Filter to only selected tests
+    selected_in_batch=()
+    for t in "${all_batch_tests[@]}"; do
+        if [[ -n "${TESTS_SELECTED[$t]:-}" ]]; then
+            selected_in_batch+=("$t")
+        fi
+    done
+
+    # Skip empty batches
+    if [[ ${#selected_in_batch[@]} -eq 0 ]]; then
+        continue
+    fi
+
+    batch_start=$SECONDS
+    set +e
+    run_batch "$batch_name" "${selected_in_batch[@]}"
+    set -e
+    batch_elapsed=$((SECONDS - batch_start))
+
+    echo ""
+    echo "Batch $batch_name completed in $(format_time $batch_elapsed)"
+done
+
+# ─── Collect Results from Timing File ─────────────────────────────────────
+
+# Re-read timing file to populate RESULTS and ELAPSED_TIMES
+while IFS=$'\t' read -r tname texit telapsed; do
+    [[ "$tname" == "test_name" ]] && continue
+    [[ "$tname" == "golden_preproc" ]] && continue
+    for test_num in "${TESTS_TO_RUN[@]}"; do
+        idx=$((test_num - 1))
+        if [[ "${TEST_NAMES[$idx]}" == "$tname" ]]; then
+            if [[ "$texit" -eq 0 ]]; then
+                RESULTS[$test_num]="OK"
+            else
+                RESULTS[$test_num]="FAIL (exit $texit)"
+            fi
+            ELAPSED_TIMES[$test_num]="$telapsed"
+        fi
+    done
+done < "$TIMING_FILE"
+
+# ─── Summary Report ──────────────────────────────────────────────────────
+
+echo ""
+echo "================================================================"
+echo "SUMMARY"
+echo "================================================================"
+
+{
+    echo "TORTOISE DIFFPREP Integration Test Results"
+    echo "Date: $(date)"
+    if [[ -n "$DOCKER_IMAGE" ]]; then
+        echo "Binary: $BINARY (Docker: $DOCKER_IMAGE)"
+    else
+        echo "Binary: $BINARY"
+    fi
+    echo "Input: $DWI"
+    echo "Output: $OUTPUT_ROOT"
+    echo "Session: $SESSION_ID"
+    echo "Volumes: $NVOLS"
+    echo "Parallel: $(if [[ $HAS_PARALLEL -eq 1 ]]; then echo "yes"; else echo "no (sequential)"; fi)"
+    echo ""
+    printf "%-40s  %-22s  %s\n" "TEST" "STATUS" "TIME"
+    printf "%-40s  %-22s  %s\n" "---" "------" "----"
+
+    for test_num in "${TESTS_TO_RUN[@]}"; do
+        idx=$((test_num - 1))
+        name="${TEST_NAMES[$idx]}"
+        status="${RESULTS[$test_num]:-SKIPPED}"
+        elapsed="${ELAPSED_TIMES[$test_num]:-0}"
+        elapsed_str="$(format_time "$elapsed")"
+        printf "%-40s  %-22s  %s\n" "$name" "$status" "$elapsed_str"
+    done
+
+    echo ""
+    echo "Disk usage per test (working + output):"
+    for test_num in "${TESTS_TO_RUN[@]}"; do
+        idx=$((test_num - 1))
+        name="${TEST_NAMES[$idx]}"
+        working_dir="$OUTPUT_ROOT/working_${name}"
+        output_dir="$OUTPUT_ROOT/${name}"
+        w_size="—"
+        o_size="—"
+        if [[ -d "$working_dir" ]]; then
+            w_size="$(du -sh "$working_dir" 2>/dev/null | cut -f1)"
+        fi
+        if [[ -d "$output_dir" ]]; then
+            o_size="$(du -sh "$output_dir" 2>/dev/null | cut -f1)"
+        fi
+        printf "  %-40s  working: %-8s  output: %s\n" "$name" "$w_size" "$o_size"
+    done
+
+    echo ""
+    echo "Comparison guidance:"
+    echo ""
+    echo "Phase 1 (tests 01-02):"
+    echo "  Compare transform params: rigid has 6 DOF, quadratic adds params 7-14."
+    echo "  Check image quality in PE direction."
+    echo ""
+    echo "Phase 2 (tests 03-06):"
+    echo "  Test 04: check for *_native_inclusion.nii (outlier maps)"
+    echo "  Test 05: check for *_s2v_transformations.txt"
+    echo "  Test 06: both — this is the full EDDY-equivalent baseline"
+    echo ""
+    echo "Phase 3a (tests 07-10) — Isolated knobs:"
+    echo "  Each test adds exactly one S2V flag to the test 06 baseline."
+    echo "  Compare each against test 06 to measure the isolated effect."
+    echo ""
+    echo "Phase 3b (tests 11-15) — Cumulative stacking:"
+    echo "  Each test adds one more flag on top of the previous."
+    echo "  Test 14 is the fully-tuned S2V configuration."
+    echo "  Test 15: check logs for convergence/early-stopping messages."
+    echo ""
+    echo "Phase 4 (tests 16-21) — Motion correction:"
+    echo "  On baseline (test 06 flags):"
+    echo "    Test 16: LMC alone        — compare vs test 06"
+    echo "    Test 17: S2V multistart   — compare vs test 06"
+    echo "    Test 18: LMC + multistart — compare vs tests 16, 17"
+    echo "  On fully-tuned (test 14 flags):"
+    echo "    Test 19: LMC alone        — compare vs test 14"
+    echo "    Test 20: S2V multistart   — compare vs test 14"
+    echo "    Test 21: LMC + multistart — compare vs tests 19, 20"
+    echo ""
+    echo "Phase 5 (tests 22-23) — Advanced:"
+    echo "  Test 22: log should show MAPMRI degree changes per epoch"
+    echo "  Test 23: *_native_inclusion.nii should flag more voxels than test 14"
+} | tee "$SUMMARY_FILE"
+
+echo ""
+echo "Full summary saved to: $SUMMARY_FILE"
+echo "Timing data saved to:  $TIMING_FILE"
+echo "Per-test logs in:      $OUTPUT_ROOT/logs/"

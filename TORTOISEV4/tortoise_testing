@@ -78,6 +78,12 @@ Test Battery (23 tests, 6 phases):
     22  p5_mapmri_schedule      Progressive MAPMRI complexity (degree 2->4->4->6)
     23  p5_aggressive_repol     Aggressive outlier flagging
 
+  Phase 6 — Kitchen sink [Batch 7, j1]
+    24  p6_kitchen_sink         LMC+ms+warm+subiters+aggr_repol+b0_id=0 (niter=5)
+
+  Phase 7 — Extended schedule [Batch 8, j1]
+    25  p7_extended_schedule    niter=7, smoothing 2.0->0, MAPMRI degree 2x4 then 4,4,6
+
 USAGE
     exit 0
 }
@@ -282,6 +288,8 @@ TEST_NAMES=(
     "test_23_p5_aggressive_repol"
     # Phase 6: Kitchen sink
     "test_24_p6_kitchen_sink"
+    # Phase 7: Extended schedule
+    "test_25_p7_extended_schedule"
 )
 
 TEST_DESCS=(
@@ -309,6 +317,7 @@ TEST_DESCS=(
     "Progressive MAPMRI complexity (degree 2->4->4->6)"
     "Aggressive outlier flagging"
     "Kitchen sink: LMC+ms+warm+subiters+convergence+aggr_repol+b0_id=0"
+    "Extended: niter=7, smoothing 2.0->0, MAPMRI degree 2x4 then 4,4,6, no convergence check"
 )
 
 # Base flags for test 06 (used by Phase 3+)
@@ -348,6 +357,8 @@ TEST_FLAGS=(
     "$TUNED14 --outlier_replacement_mode aggressive"
     # Phase 6: Kitchen sink
     "-c quadratic --niter 5 --s2v 1 --repol 1 --s2v_smoothing_schedule 1.0,0.75,0.5,0.25,0.0 --s2v_niter 3 --s2v_warm_start 1 --s2v_convergence_threshold 0.001 --large_motion_correction 1 --s2v_multistart 1 --outlier_replacement_mode aggressive --b0_id 0"
+    # Phase 7: Extended schedule
+    "-c quadratic --niter 7 --s2v 1 --repol 1 --s2v_smoothing_schedule 2.0,1.5,1.0,0.75,0.5,0.25,0.0 --s2v_niter 3 --s2v_warm_start 1 --large_motion_correction 1 --s2v_multistart 1 --outlier_replacement_mode aggressive --mapmri_degree_schedule 2,2,2,2,4,4,6 --b0_id 0"
 )
 
 NUM_TESTS=${#TEST_NAMES[@]}
@@ -361,6 +372,7 @@ BATCHES=(
     "Phase_4:6:16 17 18 19 20 21"
     "Phase_5:2:22 23"
     "Phase_6:1:24"
+    "Phase_7:1:25"
 )
 
 # ─── Parse Test Range ──────────────────────────────────────────────────────

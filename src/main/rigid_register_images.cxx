@@ -14,6 +14,7 @@
 #include "itkImageMomentsCalculator.h"
 #include "itkMultiStartOptimizerv4.h"
 #include "itkAmoebaOptimizerv4.h"
+#include "../tools/ResampleDWIs/resample_dwis.h"
 
 
 QuadraticTransformType::Pointer CompositeLinearToQuadratic(const CompositeTransformType * compositeTransform, std::string phase)
@@ -26,6 +27,7 @@ QuadraticTransformType::Pointer CompositeLinearToQuadratic(const CompositeTransf
     for( unsigned int n = 0; n < compositeTransform->GetNumberOfTransforms(); n++ )
     {
         RigidTransformType::Pointer curr_trans = dynamic_cast<RigidTransformType* const>( compositeTransform->GetNthTransform( n ).GetPointer() );
+        if(!curr_trans) continue;
         total_rigid->Compose( curr_trans, true );
     }
 
@@ -578,6 +580,189 @@ RigidTransformType::Pointer MultiStartRigidSearch(ImageType3D::Pointer fixed_img
 }
 
 
+RigidTransformType::Pointer MultiStartRigidSearch(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string metric_type, double search_range_rad, double step_size_rad)
+{
+    typedef double RealType;
+    double       pi = vnl_math::pi;
+    unsigned int mibins = 40;
+    RealType     localoptimizerlearningrate = 0.1;
+    unsigned int localoptimizeriterations = 20;
+
+    typedef itk::ImageMomentsCalculator<ImageType3D>                 ImageCalculatorType;
+    typedef itk::Vector<float, 3>                              VectorType;
+    typedef itk::MultiStartOptimizerv4         OptimizerType;
+    typedef  OptimizerType::ScalesType ScalesType;
+
+    typedef itk::MattesMutualInformationImageToImageMetricv4<ImageType3D,ImageType3D> MetricType3;
+    typedef itk::CorrelationImageToImageMetricv4<ImageType3D,ImageType3D> MetricType2;
+    using MetricType =itk::ImageToImageMetricv4<ImageType3D,ImageType3D> ;
+
+    typedef itk::RegistrationParameterScalesFromPhysicalShift<MetricType>        RegistrationParameterScalesFromPhysicalShiftType;
+    typedef  itk::ConjugateGradientLineSearchOptimizerv4 LocalOptimizerType;
+
+    VectorType ccg1,ccg2;
+
+    ImageType3D::Pointer image1 = fixed_img;
+    ImageType3D::Pointer image2 = moving_img;
+
+    ImageCalculatorType::Pointer calculator1 = ImageCalculatorType::New();
+    ImageCalculatorType::Pointer calculator2 = ImageCalculatorType::New();
+    calculator1->SetImage(  image1 );
+    calculator2->SetImage(  image2 );
+    ImageCalculatorType::VectorType fixed_center;
+    fixed_center.Fill(0);
+    ImageCalculatorType::VectorType moving_center;
+    moving_center.Fill(0);
+    try
+    {
+        calculator1->Compute();
+        fixed_center = calculator1->GetCenterOfGravity();
+        ccg1 = calculator1->GetCenterOfGravity();
+        try
+          {
+          calculator2->Compute();
+          moving_center = calculator2->GetCenterOfGravity();
+          ccg2 = calculator2->GetCenterOfGravity();
+          }
+        catch( ... )
+          {
+          std::cerr << " zero image2 error ";
+          fixed_center.Fill(0);
+          }
+    }
+    catch( ... )
+    {
+        std::cerr << " zero image1 error ";
+    }
+
+
+    RigidTransformType::Pointer affine1 = RigidTransformType::New();
+    RigidTransformType::OffsetType trans = affine1->GetOffset();
+    itk::Point<double, 3> trans2;
+    for( unsigned int i = 0; i < 3; i++ )
+    {
+       trans[i] = moving_center[i] - fixed_center[i];
+       trans2[i] =  fixed_center[i] * ( 1 );
+    }
+    affine1->SetIdentity();
+    affine1->SetOffset( trans );
+    affine1->SetCenter( trans2 );
+
+    RigidTransformType::Pointer affinesearch = RigidTransformType::New();
+    affinesearch->SetIdentity();
+    affinesearch->SetCenter( trans2 );
+
+    OptimizerType::Pointer  mstartOptimizer = OptimizerType::New();
+    MetricType::ParametersType newparams(  affine1->GetParameters() );
+
+    MetricType3::Pointer m= MetricType3::New();
+    m->SetNumberOfHistogramBins(mibins);
+
+    MetricType2::Pointer m2= MetricType2::New();
+
+    MetricType::Pointer         mimetric        = nullptr;
+    if(metric_type=="CC")
+        mimetric=m2;
+    else
+        mimetric=m;
+
+    mimetric->SetFixedImage( image1 );
+    mimetric->SetMovingImage( image2 );
+    mimetric->SetMovingTransform( affinesearch );
+    mimetric->SetParameters( newparams );
+    mimetric->Initialize();
+
+    RegistrationParameterScalesFromPhysicalShiftType::Pointer shiftScaleEstimator =      RegistrationParameterScalesFromPhysicalShiftType::New();
+    shiftScaleEstimator->SetMetric( mimetric );
+    shiftScaleEstimator->SetTransformForward( true );
+    RegistrationParameterScalesFromPhysicalShiftType::ScalesType         movingScales( affinesearch->GetNumberOfParameters() );
+    shiftScaleEstimator->EstimateScales( movingScales );
+    mstartOptimizer->SetScales( movingScales );
+    mstartOptimizer->SetMetric( mimetric );
+    OptimizerType::ParametersListType parametersList = mstartOptimizer->GetParametersList();
+
+    affinesearch->SetComputeZYX(true);
+    affinesearch->SetIdentity();
+    affinesearch->SetCenter( trans2 );
+    affinesearch->SetOffset( trans );
+    parametersList.push_back( affinesearch->GetParameters() );
+    for( double ang1 = -search_range_rad; ang1 <= search_range_rad + step_size_rad*0.5; ang1 += step_size_rad )
+    {
+        for( double ang2 = -search_range_rad; ang2 <= search_range_rad + step_size_rad*0.5; ang2 += step_size_rad )
+        {
+            for( double ang3 = -search_range_rad; ang3 <= search_range_rad + step_size_rad*0.5; ang3 += step_size_rad )
+            {
+                affinesearch->SetIdentity();
+                affinesearch->SetCenter( trans2 );
+                affinesearch->SetOffset( trans );
+                affinesearch->SetRotation(ang1,ang2,ang3);
+                parametersList.push_back( affinesearch->GetParameters() );
+            }
+        }
+    }
+    mstartOptimizer->SetParametersList( parametersList );
+
+
+    LocalOptimizerType::Pointer  localoptimizer = LocalOptimizerType::New();
+    localoptimizer->SetMetric( mimetric );
+    localoptimizer->SetScales( movingScales );
+    localoptimizer->SetLearningRate( localoptimizerlearningrate );
+    localoptimizer->SetMaximumStepSizeInPhysicalUnits( localoptimizerlearningrate );
+    localoptimizer->SetNumberOfIterations( localoptimizeriterations );
+    localoptimizer->SetLowerLimit( 0 );
+    localoptimizer->SetUpperLimit( 2 );
+    localoptimizer->SetEpsilon( 0.1 );
+    localoptimizer->SetMaximumLineSearchIterations( 20 );
+    localoptimizer->SetDoEstimateLearningRateOnce( true );
+    localoptimizer->SetMinimumConvergenceValue( 1.e-6 );
+    localoptimizer->SetConvergenceWindowSize( 3 );
+    if( localoptimizeriterations > 0 )
+    {
+        mstartOptimizer->SetLocalOptimizer( localoptimizer );
+    }
+    mstartOptimizer->StartOptimization();
+
+    RigidTransformType::Pointer bestaffine = RigidTransformType::New();
+    bestaffine->SetCenter( trans2 );
+    bestaffine->SetParameters( mstartOptimizer->GetBestParameters() );
+
+    return bestaffine;
+}
+
+
+RigidTransformType::Pointer MultiStartRigidSearchCoarseToFine(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string metric_type)
+{
+    double pi = vnl_math::pi;
+    double degtorad = 0.0174532925;
+
+    // Pass 1: Coarse search over +-90 degrees with 45-degree steps at 4x downsample
+    std::vector<float> new_res_coarse(3), factors_coarse;
+    new_res_coarse[0]= fixed_img->GetSpacing()[0] * 4.0;
+    new_res_coarse[1]= fixed_img->GetSpacing()[1] * 4.0;
+    new_res_coarse[2]= fixed_img->GetSpacing()[2] * 4.0;
+
+    ImageType3D::Pointer fixed_down4  = resample_3D_image(fixed_img,  new_res_coarse, factors_coarse, "Linear");
+    ImageType3D::Pointer moving_down4 = resample_3D_image(moving_img, new_res_coarse, factors_coarse, "Linear");
+
+    double coarse_range = pi / 2.0;     // +-90 degrees
+    double coarse_step  = 45.0 * degtorad;
+
+    RigidTransformType::Pointer coarse_result = MultiStartRigidSearch(fixed_down4, moving_down4, metric_type, coarse_range, coarse_step);
+
+    // Pass 2: Fine search within +-30 degrees of coarse result at 2x downsample
+    std::vector<float> new_res_fine(3), factors_fine;
+    new_res_fine[0]= fixed_img->GetSpacing()[0] * 2.0;
+    new_res_fine[1]= fixed_img->GetSpacing()[1] * 2.0;
+    new_res_fine[2]= fixed_img->GetSpacing()[2] * 2.0;
+
+    ImageType3D::Pointer fixed_down2  = resample_3D_image(fixed_img,  new_res_fine, factors_fine, "Linear");
+    ImageType3D::Pointer moving_down2 = resample_3D_image(moving_img, new_res_fine, factors_fine, "Linear");
+
+    // Refine with full registration starting from coarse result
+    RigidTransformType::Pointer refined = RigidRegisterImagesEuler(fixed_down2, moving_down2, metric_type, 0.25, false, coarse_result);
+
+    return refined;
+}
 
 
 #endif

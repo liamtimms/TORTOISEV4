@@ -56,6 +56,8 @@ private:                    //Main processing functions
     void DPCreateMask();
     void WriteOutputFiles();
     void MotionAndEddy();
+    void LargeMotionVolumeCorrection(std::vector<ImageType3D::Pointer>& dwis);
+    void TemporalRegularizeS2VTransforms(std::vector<OkanQuadraticTransformType::Pointer>& s2v_trans, vnl_matrix<int> slspec, float lambda);
 
 
 protected:

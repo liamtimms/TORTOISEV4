@@ -9,6 +9,11 @@
 // ============================================================
 // Test: sequential single-band (4 slices, sequential, MB=1)
 // ============================================================
+// ParseJSONForSliceTiming converts BIDS SliceTiming arrays to the slspec matrix
+// used by VolumeToSliceRegistration. The slspec encodes which slices share the same
+// excitation (MB grouping) and their temporal order. Getting this wrong means S2V
+// assigns transforms to wrong time points, mismodeling the intra-volume motion.
+
 void test_sequential_single_band()
 {
     json j;
@@ -31,6 +36,10 @@ void test_sequential_single_band()
 // ============================================================
 // Test: interleaved single-band (slices 0,2 first, then 1,3)
 // ============================================================
+// Interleaved acquisition is the clinical default (reduces cross-talk). The slspec
+// must preserve the actual temporal order (0,2,1,3) not the spatial order (0,1,2,3).
+// A spatial-order bug would pair wrong slices in the temporal regularization.
+
 void test_interleaved_single_band()
 {
     json j;
@@ -58,6 +67,10 @@ void test_interleaved_single_band()
 // ============================================================
 // Test: multiband factor 2 (4 slices, MB=2)
 // ============================================================
+// MB=2 means 2 slices are excited simultaneously. slspec must have 2 columns
+// (MB dimension) with the simultaneously-acquired slices in the same row.
+// The slice indices within each row must match the SliceTiming grouping.
+
 void test_multiband_factor_2()
 {
     json j;
@@ -106,6 +119,11 @@ void test_multiband_factor_4()
 // Test: no SliceTiming, with MultibandAccelerationFactor=2
 // Uses ComputeSlspec fallback logic (from DIFFPREP::MotionAndEddy)
 // ============================================================
+// When SliceTiming is absent (older BIDS datasets or non-BIDS input),
+// ComputeSlspec falls back to regular interleaving based on
+// MultibandAccelerationFactor. This fallback assumes regular interleaving,
+// which is common in multiband sequences.
+
 void test_no_slice_timing_with_mb()
 {
     json j;
@@ -138,6 +156,10 @@ void test_no_slice_timing_with_mb()
 // ============================================================
 // Test: no SliceTiming, no MB — identity slspec
 // ============================================================
+// With no timing info and no MB, each slice is treated as its own excitation group.
+// This is the safest fallback — it allows S2V to run with per-slice transforms
+// even when the acquisition parameters are unknown.
+
 void test_no_slice_timing_no_mb()
 {
     json j;

@@ -636,6 +636,155 @@ ImageType3D::Pointer MAPMRIModel::SynthesizeDWI(vnl_vector<double> bmat_vec)
 }
 
 
+ImageType3D::Pointer MAPMRIModel::SynthesizeDWIPerSlice(std::vector<vnl_vector<double>> per_slice_bmat_vecs)
+{
+    MAPImageType::IndexType ind_temp; ind_temp.Fill(0);
+    MAPImageType::PixelType vec= output_img->GetPixel(ind_temp);
+    int ncoeffs= vec.Size();
+
+    ImageType3D::Pointer synth_image =  ImageType3D::New();
+    synth_image->SetRegions(eval_image->GetLargestPossibleRegion());
+    synth_image->Allocate();
+    synth_image->SetOrigin(eval_image->GetOrigin());
+    synth_image->SetDirection(eval_image->GetDirection());
+    synth_image->SetSpacing(eval_image->GetSpacing());
+    synth_image->FillBuffer(0.);
+
+    ImageType3D::SizeType  size;
+    size[0]= eval_image->GetLargestPossibleRegion().GetSize()[0];
+    size[1]= eval_image->GetLargestPossibleRegion().GetSize()[1];
+    size[2]= eval_image->GetLargestPossibleRegion().GetSize()[2];
+
+    double tdiff= big_delta - small_delta/3;
+    std::vector<int> all_indices;
+    all_indices.push_back(0);
+
+    // Precompute per-slice Q-vectors
+    std::vector<vnl_matrix<double>> per_slice_qq(size[2]);
+    for(int k=0;k<(int)size[2];k++)
+    {
+        vnl_matrix<double> bmat_vec_mat(1,6);
+        bmat_vec_mat.set_row(0,per_slice_bmat_vecs[k]);
+        per_slice_qq[k]= bmat2q(bmat_vec_mat,all_indices);
+    }
+
+    for(int k=0;k<size[2];k++)
+    {
+        vnl_matrix<double>& qq = per_slice_qq[k];
+        ImageType3D::IndexType index3;
+        index3[2]=k;
+        for(int j=0;j<size[1];j++)
+        {
+            index3[1]=j;
+            for(int i=0;i<size[0];i++)
+            {
+                index3[0]=i;
+                if( (this->mask_img && this->mask_img->GetPixel(index3)) || (!this->mask_img) )
+                {
+                    MAPType coeffs= output_img->GetPixel(index3);
+                    EVecType R= evec_image->GetPixel(index3);
+                    EValType uvec= eval_image->GetPixel(index3);
+
+                    vnl_vector<double> uu(3);
+                    uu[0]= sqrt(uvec[0]*2000.*tdiff);
+                    uu[1]= sqrt(uvec[1]*2000.*tdiff);
+                    uu[2]= sqrt(uvec[2]*2000.*tdiff);
+
+                    vnl_matrix<double> qqtmp= R * qq;
+                    MatrixXd qmtrx=mk_ashore_basis(MAP_DEGREE,uu,qqtmp,1);
+
+                    double sm=0;
+                    for(int ii=0;ii<qmtrx.rows();ii++)
+                        sm+= coeffs[ii] * qmtrx(ii,0);
+
+                    if(!isnan(sm) && isfinite(sm))
+                        synth_image->SetPixel(index3,sm);
+                }
+            }
+        }
+    }
+
+    // Outlier removal (same as SynthesizeDWI)
+    float hist_min = 1E-5;
+    std::vector<float> vals;
+    itk::ImageRegionIteratorWithIndex<ImageType3D> it(synth_image,synth_image->GetLargestPossibleRegion());
+    it.GoToBegin();
+    while(!it.IsAtEnd())
+    {
+        ImageType3D::IndexType ind = it.GetIndex();
+        if(A0_img->GetPixel(ind) > 0)
+        {
+            float val= it.Get();
+            if(val > hist_min)
+                vals.push_back(val);
+        }
+        ++it;
+    }
+
+    float median_val=median(vals);
+    for(int s=0;s<(int)vals.size();s++)
+        vals[s]=fabs(vals[s]-median_val);
+    float MAD = median(vals);
+
+    it.GoToBegin();
+    while(!it.IsAtEnd())
+    {
+        ImageType3D::IndexType ind = it.GetIndex();
+        if(A0_img->GetPixel(ind) > 0)
+        {
+            float val= it.Get();
+            if( (val > median_val + 20*MAD) || (val < median_val - 20*MAD) )
+                it.Set(0);
+        }
+        ++it;
+    }
+
+    using DupType = itk::ImageDuplicator<ImageType3D>;
+    DupType::Pointer dup = DupType::New();
+    dup->SetInputImage(synth_image);
+    dup->Update();
+    ImageType3D::Pointer synth_img2= dup->GetOutput();
+
+    for(it.GoToBegin();!it.IsAtEnd();++it)
+    {
+        ImageType3D::IndexType ind = it.GetIndex();
+        if(A0_img->GetPixel(ind) > 0)
+        {
+            if(ind[0]>2 && ind[1]>2 && ind[2]>0 && ind[0]<size[0]-3 && ind[1]<size[1]-3 && ind[2]<size[2]-1)
+            {
+                std::vector<float> vals; vals.clear();
+                ImageType3D::IndexType tind3=ind;
+                for(int kk=-1;kk<=1;kk++)
+                {
+                    tind3[2]=ind[2]+kk;
+                    for(int jj=-3;jj<=3;jj++)
+                    {
+                        tind3[1]=ind[1]+jj;
+                        for(int ii=-3;ii<=3;ii++)
+                        {
+                            tind3[0]=ind[0]+ii;
+                            if(A0_img->GetPixel(tind3))
+                                vals.push_back(synth_img2->GetPixel(tind3));
+                        }
+                    }
+                }
+                if(vals.size()>0)
+                {
+                    median_val=median(vals);
+                    for(int s=0;s<(int)vals.size();s++)
+                        vals[s]=fabs(vals[s]-median_val);
+                    MAD = median(vals);
+                    if(  (synth_img2->GetPixel(ind)-median_val)/MAD > 8.)
+                        it.Set(median_val);
+                }
+            }
+        }
+    }
+
+    return synth_image;
+}
+
+
 vnl_matrix<double>  MAPMRIModel::bmat2q(vnl_matrix<double> cBMatrix, std::vector<int> all_indices,bool qspace)
 {
     vnl_matrix<double> qmat;

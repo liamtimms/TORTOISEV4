@@ -2,17 +2,19 @@
 #define _RegisterDWIToB0_CXX
 
 #include "register_dwi_to_b0.h"
-
+#include "rigid_register_images.h"
+#include "registration_settings.h"
 
 #include "itkMattesMutualInformationImageToImageMetricv4Okan.h"
 #include "itkDIFFPREPGradientDescentOptimizerv4.h"
 #include "itkOkanImageRegistrationMethodv4.h"
 #include "TORTOISE.h"
 #include "itkImageRegistrationMethodv4.h"
+#include "../tools/ResampleDWIs/resample_dwis.h"
 
 
 
-QuadraticTransformType::Pointer  RegisterDWIToB0(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string phase, MeccSettings *mecc_settings, bool initialize,std::vector<float> lim_arr, int vol,  QuadraticTransformType::Pointer minit_trans)
+QuadraticTransformType::Pointer  RegisterDWIToB0(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string phase, MeccSettings *mecc_settings, bool initialize,std::vector<float> lim_arr, int vol,  QuadraticTransformType::Pointer minit_trans, bool retry_allowed)
 {    
     int NITK= TORTOISE::GetAvailableITKThreadFor();
 
@@ -45,13 +47,15 @@ QuadraticTransformType::Pointer  RegisterDWIToB0(ImageType3D::Pointer fixed_img,
     initialTransform->SetParametersForOptimizationFlags(flags);
 
     QuadraticTransformType::ParametersType init_params= initialTransform->GetParameters();
-    init_params[0]=0;           //THIS IS NOW JUST DWI TO B=0 registration. No need to initialize. It is causing problems with spherical data
-    init_params[1]=0;
-    init_params[2]=0;
-    init_params[21]=0;
-    init_params[22]=0;
-    init_params[23]=0;
-
+    if(!minit_trans)
+    {
+        init_params[0]=0;           //THIS IS NOW JUST DWI TO B=0 registration. No need to initialize. It is causing problems with spherical data
+        init_params[1]=0;
+        init_params[2]=0;
+        init_params[21]=0;
+        init_params[22]=0;
+        init_params[23]=0;
+    }
 
     initialTransform->SetParameters(init_params);
 
@@ -240,6 +244,86 @@ QuadraticTransformType::Pointer  RegisterDWIToB0(ImageType3D::Pointer fixed_img,
         }
 
 
+
+    // Quality check: if large_motion_correction is enabled, evaluate the metric
+    // at the final transform. If it looks bad, fall back to multistart search.
+    bool large_motion = RegistrationSettings::get().getValue<bool>(std::string("large_motion_correction"));
+    if(large_motion && retry_allowed)
+    {
+        typedef itk::MattesMutualInformationImageToImageMetricv4Okan<ImageType3D,ImageType3D> QCMetricType;
+        QCMetricType::Pointer qc_metric = QCMetricType::New();
+        qc_metric->SetNumberOfHistogramBins(mecc_settings->getNBins());
+        qc_metric->SetUseMovingImageGradientFilter(false);
+        qc_metric->SetUseFixedImageGradientFilter(false);
+        qc_metric->SetFixedMin(lim_arr[0]);
+        qc_metric->SetFixedMax(lim_arr[1]);
+        qc_metric->SetMovingMin(lim_arr[2]);
+        qc_metric->SetMovingMax(lim_arr[3]);
+        qc_metric->SetFixedImage(fixed_img);
+        qc_metric->SetMovingImage(moving_img);
+        qc_metric->SetMovingTransform(initialTransform);
+        qc_metric->SetMaximumNumberOfWorkUnits(NITK);
+
+        try
+        {
+            qc_metric->Initialize();
+            double metric_value = qc_metric->GetValue();
+
+            // Also compute identity metric for comparison
+            QuadraticTransformType::Pointer id_trans = QuadraticTransformType::New();
+            id_trans->SetPhase(phase);
+            id_trans->SetIdentity();
+            qc_metric->SetMovingTransform(id_trans);
+            qc_metric->Initialize();
+            double identity_metric = qc_metric->GetValue();
+
+            // If registration made things worse than identity (metric is negative for MI,
+            // more negative is better), fall back to multistart
+            if(metric_value > identity_metric * 0.9)
+            {
+                // Registration likely failed -- try multistart
+                std::vector<float> down_factors;
+                std::vector<float> new_res(3);
+                new_res[0] = fixed_img->GetSpacing()[0] * 2.0;
+                new_res[1] = fixed_img->GetSpacing()[1] * 2.0;
+                new_res[2] = fixed_img->GetSpacing()[2] * 2.0;
+                ImageType3D::Pointer fixed_down  = resample_3D_image(fixed_img,  new_res, down_factors, "Linear");
+                ImageType3D::Pointer moving_down = resample_3D_image(moving_img, new_res, down_factors, "Linear");
+
+                RigidTransformType::Pointer ms_result = MultiStartRigidSearchCoarseToFine(fixed_down, moving_down, "MI");
+
+                if(ms_result)
+                {
+                    // Convert to quadratic init and re-run
+                    QuadraticTransformType::Pointer ms_init = QuadraticTransformType::New();
+                    ms_init->SetPhase(phase);
+                    ms_init->SetIdentity();
+                    QuadraticTransformType::ParametersType ms_params = ms_init->GetParameters();
+                    ms_params[0] = ms_result->GetOffset()[0];
+                    ms_params[1] = ms_result->GetOffset()[1];
+                    ms_params[2] = ms_result->GetOffset()[2];
+                    ms_params[3] = ms_result->GetAngleX();
+                    ms_params[4] = ms_result->GetAngleY();
+                    ms_params[5] = ms_result->GetAngleZ();
+                    ms_init->SetParameters(ms_params);
+
+                    // Re-run the full registration with the multistart result as initialization
+                    // Pass retry_allowed=false to prevent unbounded recursion
+                    QuadraticTransformType::Pointer retry_result = RegisterDWIToB0(fixed_img, moving_img, phase, mecc_settings, initialize, lim_arr, vol, ms_init, false);
+                    if(retry_result)
+                        return retry_result;
+                }
+            }
+        }
+        catch(itk::ExceptionObject &e)
+        {
+            std::cerr << "QC metric evaluation failed: " << e.GetDescription() << std::endl;
+        }
+        catch(std::exception &e)
+        {
+            std::cerr << "QC metric evaluation failed: " << e.what() << std::endl;
+        }
+    }
 
     QuadraticTransformType::Pointer finalTransform = QuadraticTransformType::New();
 

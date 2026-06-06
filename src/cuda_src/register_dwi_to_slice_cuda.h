@@ -4,6 +4,7 @@
 
 #include "defines.h"
 #include "cuda_image.h"
+#include "gaussian_smooth_image.h"
 #include "itkDIFFPREPGradientDescentOptimizerv4.h"
 #include "itkMattesMutualInformationImageToImageMetricv4Okan.h"
 #include "itkOkanImageRegistrationMethodv4.h"
@@ -11,8 +12,8 @@
 
 using OkanQuadraticTransformType=itk::OkanQuadraticTransform<CoordType,3,3>;
 
-void VolumeToSliceRegistration_cuda(ImageType3D::Pointer slice_img, ImageType3D::Pointer dwi_img , vnl_matrix<int> slspec,std::vector<float> lim_arr,std::vector<OkanQuadraticTransformType::Pointer> &s2v_transformations, bool do_eddy,std::string phase)
-{     
+void VolumeToSliceRegistration_cuda(ImageType3D::Pointer slice_img, ImageType3D::Pointer dwi_img , vnl_matrix<int> slspec,std::vector<float> lim_arr,std::vector<OkanQuadraticTransformType::Pointer> &s2v_transformations, bool do_eddy,std::string phase, ImageType3D::Pointer mask_img=nullptr, int vol=0, bool warm_start=false, float smoothing_sigma=0.0f)
+{
     int Nexc= slspec.rows();
     int MB= slspec.cols();
 
@@ -21,8 +22,19 @@ void VolumeToSliceRegistration_cuda(ImageType3D::Pointer slice_img, ImageType3D:
     if(dwi_img_cuda->getFloatdata().ptr !=nullptr)
         dwi_img_cuda->CreateTexture();
 
-    ImageType3D::SizeType sz =slice_img->GetLargestPossibleRegion().GetSize();                    
-    s2v_transformations.resize(sz[2]);
+    ImageType3D::SizeType sz =slice_img->GetLargestPossibleRegion().GetSize();
+
+    if(!warm_start || s2v_transformations.size() != (size_t)sz[2])
+    {
+        s2v_transformations.resize(sz[2]);
+        for(int k=0;k<sz[2];k++)
+        {
+            OkanQuadraticTransformType::Pointer initTrans = OkanQuadraticTransformType::New();
+            initTrans->SetPhase(phase);
+            initTrans->SetIdentity();
+            s2v_transformations[k]=initTrans;
+        }
+    }
 
 
     OkanQuadraticTransformType::ParametersType flags, grd_scales;
@@ -134,9 +146,20 @@ void VolumeToSliceRegistration_cuda(ImageType3D::Pointer slice_img, ImageType3D:
         CUDAIMAGE::Pointer temp_slice_img_itk_cuda= CUDAIMAGE::New();
         temp_slice_img_itk_cuda->SetImageFromITK(temp_slice_img_itk);
 
+        // Apply Gaussian smoothing to fixed image if smoothing_sigma > 0
+        // This helps early epochs find the right basin of attraction (like EDDY's --fwhm)
+        if(smoothing_sigma > 0)
+        {
+            temp_slice_img_itk_cuda = GaussianSmoothImage(temp_slice_img_itk_cuda, smoothing_sigma);
+        }
+
         OkanQuadraticTransformType::Pointer  initialTransform = OkanQuadraticTransformType::New();
         initialTransform->SetPhase(phase);
         initialTransform->SetIdentity();
+        if(warm_start && s2v_transformations[slspec(e,0)])
+        {
+            initialTransform->SetParameters(s2v_transformations[slspec(e,0)]->GetParameters());
+        }
         initialTransform->SetParametersForOptimizationFlags(flags);
 
 
@@ -155,7 +178,7 @@ void VolumeToSliceRegistration_cuda(ImageType3D::Pointer slice_img, ImageType3D:
         optimizer->SetMetric(metric);
         optimizer->StartOptimization(false);
 
-        TransformType::ParametersType params= optimizer->GetParameters();
+        OkanQuadraticTransformType::ParametersType params= optimizer->GetParameters();
         initialTransform->SetParameters(params);
 
         for(int kk=0;kk<MB;kk++)

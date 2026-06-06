@@ -14,6 +14,7 @@ set(TEST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/../src/external_src
     ${CMAKE_SOURCE_DIR}/../tests
     ${CMAKE_SOURCE_DIR}/../src/tools/DRBUDDI
+    ${CMAKE_SOURCE_DIR}/../src/tools/ResampleDWIs
 )
 
 # Common sources needed by multiple tests (redefine SOURCES locally for tests)
@@ -67,6 +68,8 @@ add_test(NAME OkanJacobian COMMAND test_okan_jacobian)
 add_executable(test_registration_recovery
     test_registration_recovery.cxx
     ${CMAKE_SOURCE_DIR}/../src/main/register_dwi_to_b0.cxx
+    ${CMAKE_SOURCE_DIR}/../src/main/rigid_register_images.cxx
+    ${CMAKE_SOURCE_DIR}/../src/tools/ResampleDWIs/resample_dwis.cxx
     ${COMMON_SOURCES})
 target_include_directories(test_registration_recovery PRIVATE ${TEST_INCLUDE_DIRS})
 target_link_libraries(test_registration_recovery
@@ -122,6 +125,35 @@ add_test(NAME DisplacementField COMMAND test_displacement_field)
 
 
 # ============================================================
+# Tier 0: Schedule parsing (zero external deps)
+# ============================================================
+add_executable(test_schedule_parsing test_schedule_parsing.cxx)
+target_include_directories(test_schedule_parsing PRIVATE
+    ${CMAKE_SOURCE_DIR}/../src/main)
+add_test(NAME ScheduleParsing COMMAND test_schedule_parsing)
+
+
+# ============================================================
+# Tier 2: Temporal regularization math (ITK only)
+# ============================================================
+add_executable(test_temporal_regularize test_temporal_regularize.cxx)
+target_include_directories(test_temporal_regularize PRIVATE
+    ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_temporal_regularize ${ITK_LIBRARIES})
+add_test(NAME TemporalRegularize COMMAND test_temporal_regularize)
+
+
+# ============================================================
+# Tier 0: Compile-only verification for modified headers
+# ============================================================
+add_executable(test_compile_headers test_compile_headers.cxx)
+target_include_directories(test_compile_headers PRIVATE
+    ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_compile_headers ${ITK_LIBRARIES})
+add_test(NAME CompileHeaders COMMAND test_compile_headers)
+
+
+# ============================================================
 # Tier 3: S2V registration end-to-end (VolumeToSliceRegistration)
 # ============================================================
 add_executable(test_s2v_registration
@@ -131,3 +163,49 @@ target_include_directories(test_s2v_registration PRIVATE ${TEST_INCLUDE_DIRS})
 target_link_libraries(test_s2v_registration
     ${ITK_LIBRARIES} ${Boost_LIBRARIES} OpenMP::OpenMP_CXX)
 add_test(NAME S2VRegistration COMMAND test_s2v_registration)
+
+
+# ============================================================
+# Tier 1: CLI argument parsing for new S2V settings
+# ============================================================
+add_executable(test_cli_parsing test_cli_parsing.cxx
+    ${CMAKE_SOURCE_DIR}/../src/main/TORTOISE_parser.cxx
+    ${CMAKE_SOURCE_DIR}/../src/tools/DRBUDDI/DRBUDDI_parserBase.cxx
+    ${CMAKE_SOURCE_DIR}/../src/main/antsCommandLineParser.cxx
+    ${CMAKE_SOURCE_DIR}/../src/main/antsCommandLineOption.cxx
+    ${CMAKE_SOURCE_DIR}/../src/main/defines.cxx)
+target_include_directories(test_cli_parsing PRIVATE
+    ${TEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../src/tools/DRBUDDI)
+target_link_libraries(test_cli_parsing ${ITK_LIBRARIES} ${Boost_LIBRARIES})
+add_test(NAME CLIParsing COMMAND test_cli_parsing)
+
+
+# ============================================================
+# Tier 1: Convergence metric computation logic
+# ============================================================
+add_executable(test_convergence_logic test_convergence_logic.cxx)
+target_include_directories(test_convergence_logic PRIVATE ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_convergence_logic ${ITK_LIBRARIES})
+add_test(NAME ConvergenceLogic COMMAND test_convergence_logic)
+
+
+# ============================================================
+# Tier 3: S2V epoch loop integration (warm-start, smoothing, niter, convergence)
+# ============================================================
+add_executable(test_s2v_epoch_loop
+    test_s2v_epoch_loop.cxx
+    ${COMMON_SOURCES})
+target_include_directories(test_s2v_epoch_loop PRIVATE ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_s2v_epoch_loop
+    ${ITK_LIBRARIES} ${Boost_LIBRARIES} OpenMP::OpenMP_CXX)
+add_test(NAME S2VEpochLoop COMMAND test_s2v_epoch_loop)
+
+
+# ============================================================
+# Tier 0: CUDA parity verification (skipped when USECUDA=0)
+# ============================================================
+add_executable(test_cuda_parity test_cuda_parity.cxx)
+target_include_directories(test_cuda_parity PRIVATE ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_cuda_parity ${ITK_LIBRARIES})
+add_test(NAME CUDAParity COMMAND test_cuda_parity)

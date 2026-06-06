@@ -94,6 +94,10 @@ static void mean_displacement(DisplacementFieldType::Pointer field,
 // ============================================================
 // Test: identity transform gives zero displacement field
 // ============================================================
+// ConvertEddyTransformToField converts the OkanQuadratic parametric transform to
+// a dense displacement field for FINALDATA. Identity must produce zero displacement;
+// any nonzero residual would shift every voxel in the final corrected output.
+
 void test_identity_transform_gives_zero_field()
 {
     auto ref_img = create_centered_image(24, 24, 12);
@@ -115,6 +119,11 @@ void test_identity_transform_gives_zero_field()
 // ============================================================
 // Test: translation field roundtrip (forward + invert)
 // ============================================================
+// FINALDATA applies the inverted (backward) field to warp DWI volumes and uses
+// forward transforms to rotate b-matrices. A broken round-trip means the corrected DWI data and its
+// associated gradient directions become inconsistent, corrupting all downstream
+// diffusion model fits (DTI, MAPMRI). The 0.3mm interior tolerance is sub-voxel.
+
 void test_translation_field_roundtrip()
 {
     auto ref_img = create_centered_image(24, 24, 12);
@@ -165,6 +174,11 @@ void test_translation_field_roundtrip()
 // ============================================================
 // Test: rotation field roundtrip
 // ============================================================
+// Rotations are harder to invert than translations because the displacement varies
+// spatially. The InvertDisplacementFieldImageFilterOkan uses an iterative fixed-point
+// method (50 iterations, 0.0004 mean error tolerance). The 0.5mm round-trip tolerance
+// (half a voxel) is the accuracy target for FINALDATA's warp application.
+
 void test_rotation_field_roundtrip()
 {
     auto ref_img = create_centered_image(24, 24, 12);
@@ -239,6 +253,12 @@ void test_rotation_field_roundtrip()
 // ============================================================
 // Test: eddy field inversion accuracy with quadratic terms
 // ============================================================
+// Quadratic eddy terms cause spatially-varying displacement fields: the
+// displacement varies nonlinearly across the image. The 90% sub-voxel accuracy
+// requirement ensures the inverse field doesn't introduce visible artifacts in
+// the final corrected DWI volumes. Interior-only check avoids boundary effects
+// where the inversion filter forces displacements to zero.
+
 void test_eddy_field_inversion_accuracy()
 {
     auto ref_img = create_centered_image(24, 24, 12);
@@ -320,6 +340,12 @@ void test_eddy_field_inversion_accuracy()
 // ============================================================
 // Test: DP header conversion (oblique direction -> identity)
 // ============================================================
+// DIFFPREP internally works in "DP space" (identity direction, center-voxel origin)
+// regardless of the original NIfTI header orientation. This conversion is critical
+// because OkanQuadraticTransform assumes axis-aligned coordinates — applying it
+// to oblique data without conversion rotates the eddy correction off-axis.
+// The conversion must preserve spacing exactly and set origin at center-voxel.
+
 void test_dp_header_conversion()
 {
     // Create an image with non-identity direction (oblique acquisition)

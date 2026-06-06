@@ -2917,6 +2917,49 @@ ImageType3D::Pointer DTIModel::SynthesizeDWI(vnl_vector<double> bmatrix_vec)
 }
 
 
+ImageType3D::Pointer DTIModel::SynthesizeDWIPerSlice(std::vector<vnl_vector<double>> per_slice_bmat_vecs)
+{
+    ImageType3D::Pointer synth_image = ImageType3D::New();
+    synth_image->SetRegions(A0_img->GetLargestPossibleRegion());
+    synth_image->Allocate();
+    synth_image->SetOrigin(A0_img->GetOrigin());
+    synth_image->SetDirection(A0_img->GetDirection());
+    synth_image->SetSpacing(A0_img->GetSpacing());
+    synth_image->FillBuffer(0.);
+
+    double freeWater_ADC=3E-3;
+    itk::ImageRegionIteratorWithIndex<ImageType3D> it(synth_image,synth_image->GetLargestPossibleRegion());
+    while(!it.IsAtEnd())
+    {
+        ImageType3D::IndexType ind=it.GetIndex();
+        int slice_k = ind[2];
+        const vnl_vector<double> &bmatrix_vec = per_slice_bmat_vecs[slice_k];
+
+        DTType tensor= output_img->GetPixel(ind);
+        double exp_term=0;
+        for(int i=0;i<6;i++)
+            exp_term += tensor[i] * bmatrix_vec[i];
+
+        float A0val= A0_img->GetPixel(ind);
+        float signal = A0val * exp(-exp_term);
+
+        if(exp_term < 0)
+            signal=0;
+
+        if(VF_img)
+        {
+            double exp2= freeWater_ADC*(bmatrix_vec[0] + bmatrix_vec[3] + bmatrix_vec[5]);
+            exp2=exp(-exp2);
+            signal=VF_img->GetPixel(ind)* signal + A0val*(1-VF_img->GetPixel(ind))*exp2;
+        }
+
+        if(!isnan(signal) && isfinite(signal))
+            it.Set(signal);
+        ++it;
+    }
+
+    return synth_image;
+}
 
 
 

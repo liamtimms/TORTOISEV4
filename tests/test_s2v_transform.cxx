@@ -54,6 +54,13 @@ static std::vector<TransformType::Pointer> make_identity_s2v(int nslices,
 // ============================================================
 // Test: identity transforms reproduce the original image
 // ============================================================
+// ForwardTransformImage uses a KD-tree search and inverse-distance-weighted (IDW) interpolation to scatter source voxels to target locations,
+// rather than ITK's standard pull-back (inverse) resampling. This is necessary for
+// S2V because each slice has its own transform — inverse resampling would require
+// knowing which slice's transform to invert at each target voxel, which is ambiguous
+// at slice boundaries. The 1% mismatch tolerance accounts for IDW interpolation
+// noise at grid points where multiple neighbors are equidistant.
+
 void test_identity_forward_transform()
 {
     int sx = 12, sy = 12, sz = 6;
@@ -89,6 +96,11 @@ void test_identity_forward_transform()
 // ============================================================
 // Test: uniform translation shifts the image
 // ============================================================
+// Verifies the forward-scatter direction convention: a +2mm X translation in the
+// transform moves each source voxel to index i+1, so result[i] ≈ input[i-1].
+// The 80% match threshold accounts for boundary effects and KD-tree interpolation
+// artifacts at the edges of the shifted region.
+
 void test_uniform_translation_forward()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -133,6 +145,11 @@ void test_uniform_translation_forward()
 // ============================================================
 // Test: alternating per-slice transforms
 // ============================================================
+// Verifies that ForwardTransformImage correctly applies different transforms to
+// different slices — the core requirement for S2V correction. Even slices get
+// identity (should match input), odd slices get a 2-voxel shift (should differ).
+// This catches bugs where the slice index→transform mapping is off-by-one.
+
 void test_alternating_slice_transforms()
 {
     int sx = 16, sy = 16, sz = 8;

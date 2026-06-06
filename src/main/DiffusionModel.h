@@ -115,6 +115,7 @@ public:
 
     virtual void PerformFitting(){};
     virtual ImageType3D::Pointer SynthesizeDWI(vnl_vector<double> bmat_vec){return nullptr;};
+    virtual ImageType3D::Pointer SynthesizeDWIPerSlice(std::vector<vnl_vector<double>> per_slice_bmat_vecs){return nullptr;};
 
 
 

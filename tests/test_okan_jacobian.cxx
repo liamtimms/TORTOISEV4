@@ -50,6 +50,9 @@ static ParametersType identity_params(int phase_idx)
 // ============================================================
 // Finite-difference Jacobian w.r.t. parameters
 // ============================================================
+// FD_DELTA=1e-5 and JAC_TOL=1e-4 are chosen so the finite-difference approximation
+// has ~1e-10 truncation error (O(h²)) while staying above float noise. Tighter
+// tolerance would require higher-precision FD or longer runtime.
 static void fd_jacobian_params(TransformType::Pointer t, const PointType& pt,
                                 JacobianType& fd_jac)
 {
@@ -137,6 +140,11 @@ static void compare_jacobians(const JacobianType& analytical, const JacobianType
 // ============================================================
 // Test: Jacobian w.r.t. parameters at identity (vertical phase)
 // ============================================================
+// ComputeJacobianWithRespectToParameters is called by the ITK optimizer every
+// iteration to compute the gradient. An incorrect Jacobian causes the optimizer
+// to take wrong steps, leading to failed registrations or slow convergence.
+// Columns 21-23 (center offset) are skipped because their Jacobian is intentionally
+// unimplemented — they're set once and never optimized.
 // Helper to create a PointType
 static PointType make_point(double x, double y, double z)
 {
@@ -209,6 +217,13 @@ void test_jac_params_with_linear_eddy()
 // This catches the bug on line 538 where m_Parameters[12] is
 // used instead of m_Parameters[13].
 // ============================================================
+// BUG 1 (line 538): In ComputeJacobianWithRespectToParameters, the derivative
+// w.r.t. rotation when param[13] is nonzero incorrectly reads m_Parameters[12]
+// instead of [13]. The bug is invisible when only one quadratic term is active
+// (param[12] only), which is why the single_quadratic_12 test passes but this
+// test and single_quadratic_13 fail. Tests all 3 phase directions because the
+// affected code path is phase-dependent.
+
 void test_jac_params_both_quadratic_terms()
 {
     for (int phase_idx = 0; phase_idx < 3; phase_idx++) {
@@ -245,6 +260,10 @@ void test_jac_params_both_quadratic_terms()
 // (this should pass even with the bug, since the bug only
 // manifests when param[13] is nonzero)
 // ============================================================
+// This test passes because when param[13]=0, the buggy line reads
+// m_Parameters[12] (which happens to be the correct coefficient for the
+// (x²-y²) term being differentiated). It serves as a control case.
+
 void test_jac_params_single_quadratic_12()
 {
     ParametersType p = identity_params(1);
@@ -266,6 +285,10 @@ void test_jac_params_single_quadratic_12()
 // (this will fail because the code uses m_Parameters[12] for
 // the param[13] contribution)
 // ============================================================
+// Minimal reproducer for Bug 1: with param[12]=0 and param[13]!=0, the buggy
+// line reads m_Parameters[12]=0 instead of m_Parameters[13], zeroing out the
+// (2z²-x²-y²) contribution to the rotation derivative entirely.
+
 void test_jac_params_single_quadratic_13()
 {
     ParametersType p = identity_params(1);
@@ -285,6 +308,10 @@ void test_jac_params_single_quadratic_13()
 // ============================================================
 // Test: Jacobian w.r.t. position at identity
 // ============================================================
+// ComputeJacobianWithRespectToPosition computes the spatial Jacobian needed for
+// intensity modulation (Jacobian determinant correction). An incorrect spatial Jacobian
+// would cause signal intensity errors if used during resampling.
+
 void test_jac_position_identity()
 {
     ParametersType p = identity_params(1);
@@ -327,6 +354,12 @@ void test_jac_position_with_eddy()
 // This catches the bug on line 624 where x1*x1*y1*y1 (multiply)
 // is used instead of x1*x1-y1*y1 (subtract).
 // ============================================================
+// BUG 2 (line 624): In the cubic code path of ComputeJacobianWithRespectToPosition,
+// the (x²-y²) spherical harmonic derivative uses x1*x1*y1*y1 (product) instead
+// of x1*x1-y1*y1 (difference). This only triggers when cubic optimization flags
+// are active (enable_cubic=true), which routes through a separate code path that
+// recomputes the quadratic derivatives alongside the cubic ones.
+
 void test_jac_position_cubic()
 {
     for (int phase_idx = 0; phase_idx < 3; phase_idx++) {
@@ -359,6 +392,11 @@ void test_jac_position_cubic()
 // ============================================================
 // Test: Jacobian determinant sanity checks
 // ============================================================
+// Near-identity transforms should have det(J) ~ 1 (volume-preserving). With
+// moderate eddy terms, det(J) must remain positive — negative determinant means
+// the transform has folded space, which causes resampling artifacts. The 0.01
+// tolerance matches the typical eddy magnitude for clinical b=1000 data.
+
 void test_jac_determinant_sanity()
 {
     // Near-identity: determinant should be close to 1

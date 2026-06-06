@@ -35,6 +35,11 @@ static TransformType::Pointer make_with_param(const std::string& phase, int idx,
 // ============================================================
 // Test: identity transform returns the input point unchanged
 // ============================================================
+// Verifies SetIdentity correctly initializes the 24-parameter state for each phase
+// encoding direction. A broken identity is catastrophic — every DWI volume in
+// DIFFPREP starts from identity before optimization, so a wrong baseline shifts
+// all subsequent motion/eddy estimates.
+
 void test_identity_horizontal()
 {
     auto t = make_identity("horizontal");
@@ -69,6 +74,10 @@ void test_identity_slice()
 // ============================================================
 // Test: identity params have correct structure
 // ============================================================
+// The phase index (0=horizontal, 1=vertical, 2=slice) determines which linear
+// eddy coefficient (params[6/7/8]) is set to 1 at identity. Getting this mapping
+// wrong applies eddy correction along the wrong spatial axis.
+
 void test_identity_params()
 {
     // For phase=1 (vertical), identity should have params[7]=1, all others 0
@@ -98,6 +107,11 @@ void test_identity_params()
 // ============================================================
 // Test: pure translation
 // ============================================================
+// Verifies that translation parameters interact correctly with the phase-direction
+// polynomial replacement. The transform first applies rigid motion (rotation +
+// translation), then replaces the phase coordinate with the eddy polynomial —
+// a wrong ordering would corrupt the translation component.
+
 void test_pure_translation()
 {
     // With phase=vertical, translation params[0-2] shift the point,
@@ -127,6 +141,9 @@ void test_pure_translation()
 // ============================================================
 // Test: rotation matrix Rz(pi/2) maps (1,0,0) to (0,1,0)
 // ============================================================
+// Verifies the Rz*Ry*Rx Euler decomposition used for head motion correction.
+// DIFFPREP optimizes params[3-5] (Rx,Ry,Rz in radians) per DWI volume.
+
 void test_rotation_z_90()
 {
     auto t = make_identity("vertical");
@@ -186,6 +203,11 @@ void test_rotation_matrix_composition()
 // ============================================================
 // Test: phase direction controls which coordinate is replaced
 // ============================================================
+// The phase encoding direction determines which spatial coordinate is replaced
+// by the eddy current polynomial. A wrong mapping applies distortion correction
+// along the wrong axis — hard to detect visually but causes systematic bias in
+// diffusion tensor orientation.
+
 void test_phase_direction_horizontal()
 {
     // For phase=horizontal, only x-coordinate is replaced by eddy polynomial
@@ -211,6 +233,10 @@ void test_phase_direction_horizontal()
 // ============================================================
 // Test: linear eddy scaling in phase direction
 // ============================================================
+// params[7]=1.05 models a 5% global scaling from eddy currents in the PE direction.
+// This linear term dominates the eddy correction for most clinical protocols.
+// The "quadratic" and higher MECC profiles optimize these linear terms (params 6-8) alongside rigid motion.
+
 void test_linear_eddy_scaling()
 {
     // With phase=vertical, params[7] = 1.05 means 5% scaling in PE direction
@@ -231,6 +257,11 @@ void test_linear_eddy_scaling()
 // ============================================================
 // Test: quadratic eddy term params[12] = (x^2 - y^2)
 // ============================================================
+// params[12] and [13] are second-order spherical harmonic eddy terms, enabled in
+// the "quadratic" MECC profile. These model spatially-varying distortions from
+// eddy currents that a simple affine (linear) model cannot capture.
+// params[12] = coeff * (x² - y²), params[13] = coeff * (2z² - x² - y²).
+
 void test_quadratic_eddy_x2_y2()
 {
     auto t = make_identity("vertical");
@@ -277,6 +308,10 @@ void test_quadratic_eddy_2z2_x2_y2()
 // ============================================================
 // Test: center offset (params 21-23) shifts rotation center
 // ============================================================
+// The rotation center must match the image center (set by DIFFPREP at registration
+// init). Misalignment causes incorrect motion correction for off-center slices.
+// params[21-23] are not optimized in standard MECC profiles — they're set once and held fixed. (The `_isoc` profile variants do optimize them.)
+
 void test_center_offset()
 {
     // With a center offset, rotation should happen around that center
@@ -330,6 +365,9 @@ void test_center_offset_with_rotation()
 // ============================================================
 // Test: SetParameters / GetParameters roundtrip
 // ============================================================
+// Parameters are get/set thousands of times per registration (optimizer iterations).
+// A lossy roundtrip would cause the optimizer to drift silently.
+
 void test_set_get_parameters_roundtrip()
 {
     auto t = make_identity("vertical");
@@ -349,6 +387,11 @@ void test_set_get_parameters_roundtrip()
 // ============================================================
 // Test: cubic term params[14] = x*y*z
 // ============================================================
+// Cubic eddy terms (params 14-20) are only enabled in the "cubic" MECC profile.
+// The optimization flags gate whether these terms contribute to TransformPoint.
+// Using 0.0001 as coefficient keeps the cubic contribution small (0.1mm at 10mm)
+// to match realistic eddy magnitudes.
+
 void test_cubic_xyz_term()
 {
     auto t = make_identity("vertical");

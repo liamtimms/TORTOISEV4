@@ -18,7 +18,8 @@ RigidTransformType::Pointer RigidRegisterImagesEulerSmall(ImageType3D::Pointer f
 
 
 RigidTransformType::Pointer MultiStartRigidSearch(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string metric_type);
-
+RigidTransformType::Pointer MultiStartRigidSearch(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string metric_type, double search_range_rad, double step_size_rad);
+RigidTransformType::Pointer MultiStartRigidSearchCoarseToFine(ImageType3D::Pointer fixed_img, ImageType3D::Pointer moving_img,std::string metric_type);
 
 
 #endif

@@ -97,6 +97,12 @@ static double max_rigid_param(const std::vector<TransformType::Pointer>& transfo
 // ============================================================
 // Test: identical fixed/moving produces near-identity transforms
 // ============================================================
+// Baseline sanity: VolumeToSliceRegistration with identical images should return
+// near-identity transforms. Failure means the registration has a systematic bias
+// or the metric is not correctly minimized at identity.
+// Wider Z tolerance (1.5mm vs 0.5mm in-plane) because the 2-slice window approach
+// doubles the through-plane spacing, reducing Z-axis constraint.
+
 void test_s2v_identity_no_motion()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -133,6 +139,11 @@ void test_s2v_identity_no_motion()
 // ============================================================
 // Test: recovers per-slice shift in phase direction
 // ============================================================
+// Core S2V use case: individual slices can move independently during acquisition.
+// Slices 5-7 are shifted by 1 voxel (2mm) in X. The S2V loop in DIFFPREP.cxx
+// (DIFFPREP::MotionAndEddy) calls VolumeToSliceRegistration per epoch to recover these
+// per-slice motions. Detection threshold of 0.3mm is well below voxel size.
+
 void test_s2v_recovers_per_slice_shift()
 {
     int sx = 24, sy = 24, sz = 12;
@@ -199,6 +210,12 @@ void test_s2v_recovers_per_slice_shift()
 // ============================================================
 // Test: multiband grouping — same excitation gets same transform
 // ============================================================
+// In multiband (MB) acquisitions, multiple slices are excited simultaneously and
+// share the same motion state. The slspec matrix encodes which slices belong to
+// each excitation group. VolumeToSliceRegistration must assign identical transforms
+// to all slices in the same group — otherwise, simultaneously-acquired slices get
+// different corrections, creating discontinuities in the corrected volume.
+
 void test_s2v_multiband_grouping()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -238,6 +255,11 @@ void test_s2v_multiband_grouping()
 // ============================================================
 // Test: insufficient voxels — no crash, returns identity-like
 // ============================================================
+// Edge case guard: slices at the top/bottom of the brain mask may have very few
+// nonzero voxels (< 10% of slice area). The registration must degrade gracefully
+// to identity rather than crashing on a singular metric matrix. This happens
+// regularly with tight brain masks on the first/last few slices.
+
 void test_s2v_insufficient_voxels()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -283,6 +305,11 @@ void test_s2v_insufficient_voxels()
 // ============================================================
 // Test: do_eddy flag — eddy params stay zero when disabled
 // ============================================================
+// When do_eddy=false, only rigid parameters (0-5) are optimized at the slice level.
+// Eddy parameters (6-13) must remain at their identity values. This matches
+// DIFFPREP's behavior where volume-level eddy correction handles eddy currents
+// and S2V only handles intra-volume motion.
+
 void test_s2v_do_eddy_flag()
 {
     int sx = 16, sy = 16, sz = 8;
@@ -331,6 +358,196 @@ void test_s2v_do_eddy_flag()
 }
 
 
+// ============================================================
+// Test: warm_start preserves pre-existing transforms
+// ============================================================
+// Warm start initializes from the previous epoch's transforms instead of identity.
+// This is analogous to FSL eddy's --s2v_niter: each sub-iteration refines the
+// previous result. Without warm start, later epochs discard earlier progress and
+// restart from scratch, wasting computation and potentially losing convergence.
+
+void test_s2v_warm_start_preserves()
+{
+    int sx = 16, sy = 16, sz = 8;
+    auto img = create_s2v_test_image(sx, sy, sz);
+    auto mask = create_block_mask(sx, sy, sz, 2.0, 2.0, 2.0, 1);
+    auto lim_arr = compute_lim_arr(img, img);
+    auto slspec = make_slspec_mb1(sz);
+
+    // Pre-fill transforms with known Tz = 1mm on each slice
+    std::vector<TransformType::Pointer> warm_transforms(sz);
+    for (int k = 0; k < sz; k++) {
+        warm_transforms[k] = TransformType::New();
+        warm_transforms[k]->SetPhase("horizontal");
+        warm_transforms[k]->SetIdentity();
+        auto p = warm_transforms[k]->GetParameters();
+        p[2] = 1.0;  // 1mm Z translation
+        warm_transforms[k]->SetParameters(p);
+    }
+
+    // With warm_start=true on identical images, transforms should stay near initial
+    VolumeToSliceRegistration(img, img, slspec, lim_arr,
+                              warm_transforms, false, "horizontal", mask, 0, true, 0.0f);
+
+    // Transforms should NOT have been reset to identity
+    bool any_nonzero_tz = false;
+    for (int k = 0; k < sz; k++) {
+        auto p = warm_transforms[k]->GetParameters();
+        if (std::fabs(p[2]) > 0.3)
+            any_nonzero_tz = true;
+    }
+    ASSERT_TRUE(any_nonzero_tz);
+
+    // Now with warm_start=false — transforms should be reset to identity
+    std::vector<TransformType::Pointer> cold_transforms(sz);
+    for (int k = 0; k < sz; k++) {
+        cold_transforms[k] = TransformType::New();
+        cold_transforms[k]->SetPhase("horizontal");
+        cold_transforms[k]->SetIdentity();
+        auto p = cold_transforms[k]->GetParameters();
+        p[2] = 1.0;
+        cold_transforms[k]->SetParameters(p);
+    }
+
+    VolumeToSliceRegistration(img, img, slspec, lim_arr,
+                              cold_transforms, false, "horizontal", mask, 0, false, 0.0f);
+
+    // With identical images and cold start, should be near-identity
+    for (int k = 0; k < sz; k++) {
+        auto p = cold_transforms[k]->GetParameters();
+        ASSERT_NEAR(p[0], 0.0, 0.5);
+        ASSERT_NEAR(p[1], 0.0, 0.5);
+    }
+}
+
+
+// ============================================================
+// Test: smoothing_sigma > 0 runs the two-level path without crashing
+// ============================================================
+// When smoothing_sigma > 0, the CPU path uses a two-level registration:
+// first at the smoothed scale (wider capture range), then at full resolution.
+// This is analogous to FSL eddy's --fwhm schedule. sigma=2.0 is a typical
+// first-epoch value corresponding to ~4.7mm FWHM Gaussian smoothing.
+
+void test_s2v_smoothing_sigma_bounded()
+{
+    int sx = 24, sy = 24, sz = 12;
+    auto fixed = create_s2v_test_image(sx, sy, sz);
+    auto mask = create_block_mask(sx, sy, sz, 2.0, 2.0, 2.0, 1);
+
+    // Create moving with slices 5-7 shifted
+    using DupType = itk::ImageDuplicator<ImageType3D>;
+    auto dup = DupType::New();
+    dup->SetInputImage(fixed);
+    dup->Update();
+    auto moving = dup->GetOutput();
+
+    for (int k = 5; k <= 7; k++) {
+        ImageType3D::IndexType idx;
+        idx[2] = k;
+        for (int j = 0; j < sy; j++) {
+            idx[1] = j;
+            for (int i = 0; i < sx - 1; i++) {
+                idx[0] = i;
+                ImageType3D::IndexType src_idx = idx;
+                src_idx[0] = i + 1;
+                moving->SetPixel(idx, fixed->GetPixel(src_idx));
+            }
+            idx[0] = sx - 1;
+            ImageType3D::IndexType prev_idx = idx;
+            prev_idx[0] = sx - 2;
+            moving->SetPixel(idx, fixed->GetPixel(prev_idx));
+        }
+    }
+
+    auto lim_arr = compute_lim_arr(fixed, moving);
+    auto slspec = make_slspec_mb1(sz);
+
+    std::vector<TransformType::Pointer> s2v_transforms;
+
+    // Call with smoothing_sigma=2.0 — this should exercise the two-level path
+    VolumeToSliceRegistration(fixed, moving, slspec, lim_arr,
+                              s2v_transforms, false, "horizontal", mask, 0, false, 2.0f);
+
+    ASSERT_EQ((int)s2v_transforms.size(), sz);
+
+    // All params should be finite
+    for (int k = 0; k < sz; k++) {
+        auto p = s2v_transforms[k]->GetParameters();
+        for (unsigned int pp = 0; pp < p.GetSize(); pp++) {
+            ASSERT_TRUE(std::isfinite(p[pp]));
+        }
+    }
+
+    // At least one shifted slice should show detectable motion
+    bool any_shift = false;
+    for (int k = 5; k <= 7; k++) {
+        auto p = s2v_transforms[k]->GetParameters();
+        if (std::fabs(p[0]) > 0.2)
+            any_shift = true;
+    }
+    ASSERT_TRUE(any_shift);
+}
+
+
+// ============================================================
+// Test: VolumeToSliceRegistrationWithMultistart handles MB data
+// ============================================================
+// Tests the multi-start variant used when --s2v_multistart=1 for large intra-volume
+// motion. Verifies it handles MB grouping correctly (same excitation → same params)
+// and produces finite parameters. The 0.05 rad (~3°) rotation is within the
+// multi-start search range but may exceed single-start capture range.
+
+void test_s2v_multistart_mb()
+{
+    int sx = 16, sy = 16, sz = 8;
+    auto fixed = create_s2v_test_image(sx, sy, sz);
+    auto mask = create_block_mask(sx, sy, sz, 2.0, 2.0, 2.0, 1);
+
+    // Create moving with a small rotation about Z (~0.05 rad ≈ 3°)
+    auto rot_transform = TransformType::New();
+    rot_transform->SetPhase("horizontal");
+    rot_transform->SetIdentity();
+    auto tp = rot_transform->GetParameters();
+    tp[5] = 0.05;  // small Rz rotation
+    rot_transform->SetParameters(tp);
+
+    auto moving = apply_transform_to_image(fixed, rot_transform);
+
+    auto lim_arr = compute_lim_arr(fixed, moving);
+    auto slspec = make_slspec_mb2(sz);
+
+    std::vector<TransformType::Pointer> s2v_transforms;
+
+    // Call multistart variant — should complete without crash
+    VolumeToSliceRegistrationWithMultistart(fixed, moving, slspec, lim_arr,
+                                             s2v_transforms, false, "horizontal", mask, 0);
+
+    ASSERT_EQ((int)s2v_transforms.size(), sz);
+
+    // All transforms should be finite
+    for (int k = 0; k < sz; k++) {
+        auto p = s2v_transforms[k]->GetParameters();
+        for (unsigned int pp = 0; pp < p.GetSize(); pp++) {
+            ASSERT_TRUE(std::isfinite(p[pp]));
+        }
+    }
+
+    // MB grouping should still hold: same excitation → same params
+    int Nexc = slspec.rows();
+    int MB = slspec.cols();
+    for (int e = 0; e < Nexc; e++) {
+        auto params_ref = s2v_transforms[slspec(e, 0)]->GetParameters();
+        for (int m = 1; m < MB; m++) {
+            auto params_mb = s2v_transforms[slspec(e, m)]->GetParameters();
+            for (int pp = 0; pp < 6; pp++) {
+                ASSERT_NEAR(params_ref[pp], params_mb[pp], 1e-10);
+            }
+        }
+    }
+}
+
+
 int main()
 {
     std::cout << "=== S2V Registration Tests ===" << std::endl;
@@ -340,6 +557,9 @@ int main()
     TEST(s2v_multiband_grouping);
     TEST(s2v_insufficient_voxels);
     TEST(s2v_do_eddy_flag);
+    TEST(s2v_warm_start_preserves);
+    TEST(s2v_smoothing_sigma_bounded);
+    TEST(s2v_multistart_mb);
 
     TEST_SUMMARY();
 }

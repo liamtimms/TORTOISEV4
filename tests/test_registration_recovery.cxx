@@ -5,6 +5,7 @@
 #include "test_macros.h"
 #include "test_image_helpers.h"
 #include "register_dwi_to_b0.h"
+#include "rigid_register_images.h"
 
 // RegisterDWIToB0 calls TORTOISE::GetAvailableITKThreadFor() which needs
 // these static definitions. Provided via linking TORTOISE_global.cxx.
@@ -33,6 +34,13 @@ static MeccSettings make_quadratic_settings()
 // ============================================================
 // Test: recover a known translation
 // ============================================================
+// Verifies RegisterDWIToB0 recovers a known 2/1.5/1mm translation from a synthetic
+// Gaussian blob. This is the core of DIFFPREP's per-volume motion correction.
+// 0.5mm tolerance is ~25% of voxel size (2mm) — tighter than clinical requirements
+// but loose enough for a 48³ synthetic image with limited spatial frequency content.
+// Recovered parameters have opposite signs because RegisterDWIToB0 finds the
+// moving→fixed (inverse) transform.
+
 void test_translation_recovery()
 {
     // Create fixed image: 48x48x24, 2mm isotropic, Gaussian blob
@@ -83,6 +91,11 @@ void test_translation_recovery()
 // ============================================================
 // Test: recover a rigid transform (translation + rotation)
 // ============================================================
+// Tests coupled translation+rotation recovery. Wider tolerance (1.0mm, 0.02 rad)
+// because translation and rotation are coupled in the optimization — a small
+// rotation error gets absorbed into translation and vice versa, especially with
+// the smooth Gaussian blob providing limited rotational gradient information.
+
 void test_rigid_recovery()
 {
     auto fixed = create_gaussian_blob(48, 48, 24, 2.0, 2.0, 2.0,
@@ -123,6 +136,11 @@ void test_rigid_recovery()
 // ============================================================
 // Test: optimization flags are respected (rotation disabled)
 // ============================================================
+// Verifies that MeccSettings flags correctly gate which parameters the optimizer
+// can modify. The "justeddy" MECC profile disables rotation (flags[3-5]=false)
+// to speed up registration when motion is known to be small. If flags are ignored,
+// the optimizer wastes iterations on unnecessary DOFs.
+
 void test_flags_respected()
 {
     auto fixed = create_gaussian_blob(48, 48, 24, 2.0, 2.0, 2.0,
@@ -162,6 +180,47 @@ void test_flags_respected()
 }
 
 
+// ============================================================
+// Test: MultiStartRigidSearchCoarseToFine recovers large rotation
+// ============================================================
+// Tests the multi-resolution initialization used when --large_motion_correction=1.
+// A 25° rotation exceeds the capture range of single-scale registration, so the
+// coarse-to-fine search (4x→2x downsampling with multi-start) is required.
+// 15° tolerance (0.26 rad) is generous because the coarse search uses 45° angular
+// steps — we only need the correct basin, not sub-degree precision.
+
+void test_coarse_to_fine_large_rotation()
+{
+    // Create fixed: large enough for downsampling (4x and 2x)
+    auto fixed = create_gaussian_blob(48, 48, 24, 2.0, 2.0, 2.0,
+                                       20.0, 25.0, 15.0, 800.0f);
+
+    // Apply 25° rotation about Y (0.436 rad)
+    auto true_transform = TestTransformType::New();
+    true_transform->SetPhase("vertical");
+    true_transform->SetIdentity();
+    auto tp = true_transform->GetParameters();
+    tp[4] = 0.436;  // ~25° about Y
+    true_transform->SetParameters(tp);
+
+    auto moving = apply_transform_to_image(fixed, true_transform);
+
+    // Call coarse-to-fine multistart search
+    auto result = MultiStartRigidSearchCoarseToFine(fixed, moving, "CC");
+
+    ASSERT_TRUE(result != nullptr);
+
+    auto rp = result->GetParameters();
+
+    // Euler3DTransform params: [Rx, Ry, Rz, Tx, Ty, Tz]
+    // OkanQuadratic params:    [Tx, Ty, Tz, Rx, Ry, Rz, ...]
+    // We applied Ry=0.436 in Okan space (index 4), recover from Euler (index 1)
+    double recovered_ry = rp[1];
+    // Allow 15° tolerance (0.26 rad) — coarse search uses large steps
+    ASSERT_TRUE(std::fabs(std::fabs(recovered_ry) - 0.436) < 0.26);
+}
+
+
 int main()
 {
     std::cout << "=== Registration Recovery Tests ===" << std::endl;
@@ -169,6 +228,7 @@ int main()
     TEST(translation_recovery);
     TEST(rigid_recovery);
     TEST(flags_respected);
+    TEST(coarse_to_fine_large_rotation);
 
     TEST_SUMMARY();
 }
